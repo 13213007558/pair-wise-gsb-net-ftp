@@ -93,11 +93,34 @@ module Net
     FTP_PORT = 21
     CRLF = "\r\n"
     DEFAULT_BLOCKSIZE = BufferedIO::BUFSIZE
+    MODE_STREAM = "S"
+    MODE_BLOCK = "B"
+    BLOCK_HEADER_SIZE = 3
+    BLOCK_MAX_SIZE = 65535
+    BLOCK_DESCRIPTOR_EOR = 0x80
+    BLOCK_DESCRIPTOR_EOF = 0x40
+    BLOCK_DESCRIPTOR_RESTART_MARKER = 0x20
+    BLOCK_DESCRIPTOR_ERROR = 0x10
     @@default_passive = true
     # :startdoc:
 
     # When +true+, transfers are performed in binary mode.  Default: +true+.
     attr_reader :binary
+
+    # The transfer mode.  +"S"+ is stream mode and +"B"+ is RFC 959 block
+    # mode.  Default: +"S"+.
+    attr_reader :mode
+
+    # Number of file data bytes in the most recent transfer.  Restart markers
+    # and block headers are not included.
+    attr_reader :last_transfer_data_bytes
+
+    # Number of protocol bytes in the most recent block mode transfer.  This
+    # includes block headers and restart marker payloads.
+    attr_reader :last_transfer_protocol_bytes
+
+    # The most recent restart marker received in block mode.
+    attr_reader :restart_marker
 
     # When +true+, the connection is in passive mode.  Default: +true+.
     attr_accessor :passive
@@ -213,6 +236,8 @@ module Net
     # account::   Account information for ACCT.
     # passive::   When +true+, the connection is in passive mode. Default:
     #             +true+.
+    # mode::      Transfer mode. +"S"+ selects stream mode and +"B"+ selects
+    #             RFC 959 block mode. Default: +"S"+.
     # open_timeout::  Number of seconds to wait for the connection to open.
     #                 See Net::FTP#open_timeout for details.  Default: +nil+.
     # read_timeout::  Number of seconds to wait for one block to be read.
@@ -283,6 +308,10 @@ module Net
         @implicit_ftps = false
       end
       @binary = true
+      self.mode = options[:mode] || MODE_STREAM
+      @last_transfer_data_bytes = 0
+      @last_transfer_protocol_bytes = 0
+      @restart_marker = nil
       if options[:passive].nil?
         @passive = @@default_passive
       else
@@ -318,6 +347,19 @@ module Net
       end
     end
 
+    # Sets the data transfer mode.  +newmode+ is +"S"+ for stream mode or
+    # +"B"+ for RFC 959 block mode.
+    def mode=(newmode)
+      newmode = newmode.to_s.upcase
+      unless [MODE_STREAM, MODE_BLOCK].include?(newmode)
+        raise ArgumentError, "unsupported transfer mode: #{newmode}"
+      end
+      if @logged_in && newmode != @mode
+        voidcmd("MODE #{newmode}")
+      end
+      @mode = newmode
+    end
+
     # Sends a command to destination host, with the current binary sendmode
     # type.
     #
@@ -331,6 +373,13 @@ module Net
       end
     end
     private :send_type_command
+
+    def send_mode_command # :nodoc:
+      unless @mode == MODE_STREAM
+        voidcmd("MODE #{@mode}")
+      end
+    end
+    private :send_mode_command
 
     # Toggles transfers in binary mode and yields to a block.
     # This preserves your current binary send mode, but allows a temporary
@@ -654,6 +703,7 @@ module Net
       end
       @welcome = resp
       send_type_command
+      send_mode_command
       @logged_in = true
     end
 
@@ -666,18 +716,48 @@ module Net
     def retrbinary(cmd, blocksize, rest_offset = nil) # :yield: data
       synchronize do
         with_binary(true) do
+          conn = nil
+          transfer_error = nil
+          response_consumed = false
           begin
             conn = transfercmd(cmd, rest_offset)
-            while data = conn.read(blocksize)
-              yield(data)
+            @last_transfer_data_bytes = 0
+            @last_transfer_protocol_bytes = 0
+            @restart_marker = nil
+            if @mode == MODE_BLOCK
+              @last_transfer_data_bytes,
+              @last_transfer_protocol_bytes =
+                read_block_mode_transfer(conn, blocksize) do |data,
+                                                             data_bytes,
+                                                             protocol_bytes|
+                  @last_transfer_data_bytes = data_bytes
+                  @last_transfer_protocol_bytes = protocol_bytes
+                  yield(data,
+                        @last_transfer_data_bytes,
+                        @last_transfer_protocol_bytes)
+                end
+            else
+              while data = conn.read(blocksize)
+                @last_transfer_data_bytes += data.bytesize
+                yield(data)
+              end
+              conn.shutdown(Socket::SHUT_WR) rescue nil
+              conn.read_timeout = 1
+              conn.read rescue nil
             end
-            conn.shutdown(Socket::SHUT_WR) rescue nil
-            conn.read_timeout = 1
-            conn.read rescue nil
+          rescue StandardError => transfer_error
+            begin
+              voidresp
+              response_consumed = true
+            rescue StandardError
+              response_consumed = true
+              raise
+            end
           ensure
             conn.close if conn
           end
           voidresp
+          raise transfer_error if transfer_error
         end
       end
     end
@@ -713,25 +793,59 @@ module Net
     # +file+ to the server. If the optional block is given, it also passes it
     # the data, in chunks of +blocksize+ characters.
     #
-    def storbinary(cmd, file, blocksize, rest_offset = nil) # :yield: data
+    def storbinary(cmd, file, blocksize, rest_offset = nil,
+                   &progress_block) # :yield: data
       if rest_offset
         file.seek(rest_offset, IO::SEEK_SET)
       end
       synchronize do
         with_binary(true) do
+          conn = nil
+          transfer_error = nil
+          response_consumed = false
           begin
             conn = transfercmd(cmd)
-            while buf = file.read(blocksize)
-              conn.write(buf)
-              yield(buf) if block_given?
+            @last_transfer_data_bytes = 0
+            @last_transfer_protocol_bytes = 0
+            @restart_marker = nil
+            if @mode == MODE_BLOCK
+              @last_transfer_data_bytes,
+              @last_transfer_protocol_bytes =
+                write_block_mode_transfer(conn, file, blocksize,
+                                          rest_offset) do |buf,
+                                                            data_bytes,
+                                                            protocol_bytes|
+                  @last_transfer_data_bytes = data_bytes
+                  @last_transfer_protocol_bytes = protocol_bytes
+                  progress_block&.call(buf,
+                                       @last_transfer_data_bytes,
+                                       @last_transfer_protocol_bytes)
+                end
+            else
+              while buf = file.read(blocksize)
+                conn.write(buf)
+                @last_transfer_data_bytes += buf.bytesize
+                progress_block&.call(buf,
+                                     @last_transfer_data_bytes,
+                                     @last_transfer_protocol_bytes)
+              end
+              conn.shutdown(Socket::SHUT_WR) rescue nil
+              conn.read_timeout = 1
+              conn.read rescue nil
             end
-            conn.shutdown(Socket::SHUT_WR) rescue nil
-            conn.read_timeout = 1
-            conn.read rescue nil
+          rescue StandardError => transfer_error
+            begin
+              voidresp
+              response_consumed = true
+            rescue StandardError
+              response_consumed = true
+              raise
+            end
           ensure
             conn.close if conn
           end
           voidresp
+          raise transfer_error if transfer_error
         end
       end
     rescue Errno::EPIPE
@@ -1481,6 +1595,119 @@ module Net
       return resp.slice(/"(([^"]|"")*)"/, 1).to_s.gsub(/""/, '"')
     end
     private :parse257
+
+    def read_block_mode_transfer(conn, blocksize) # :nodoc:
+      data_bytes = 0
+      protocol_bytes = 0
+      pending = String.new(encoding: Encoding::ASCII_8BIT)
+      eof = false
+
+      until eof
+        header = String.new(encoding: Encoding::ASCII_8BIT)
+        unless read_exact(conn, BLOCK_HEADER_SIZE, header)
+          raise FTPProtoError, "premature end of block mode transfer"
+        end
+        descriptor = header.getbyte(0)
+        size = (header.getbyte(1) << 8) | header.getbyte(2)
+        protocol_bytes += BLOCK_HEADER_SIZE
+
+        data = String.new(encoding: Encoding::ASCII_8BIT)
+        unless read_exact(conn, size, data)
+          raise FTPProtoError, "truncated block mode payload"
+        end
+
+        if descriptor & BLOCK_DESCRIPTOR_ERROR != 0
+          raise FTPProtoError, "error block received in block mode transfer"
+        end
+
+        eof = descriptor & BLOCK_DESCRIPTOR_EOF != 0
+        eor = descriptor & BLOCK_DESCRIPTOR_EOR != 0
+        marker = descriptor & BLOCK_DESCRIPTOR_RESTART_MARKER != 0
+        reserved = descriptor & 0x0f
+
+        if marker
+          @restart_marker = data
+          protocol_bytes += size
+        elsif reserved != 0
+          raise FTPProtoError,
+                "invalid block mode descriptor: #{descriptor.to_s(16)}"
+        else
+          data_bytes += size
+          pending << data
+          while pending.bytesize >= blocksize
+            chunk = pending.byteslice(0, blocksize)
+            pending = pending.byteslice(blocksize, pending.bytesize - blocksize)
+            yield(chunk, data_bytes, protocol_bytes)
+          end
+        end
+
+        if eor && pending.bytesize > 0
+          yield(pending, data_bytes, protocol_bytes)
+          pending = String.new(encoding: Encoding::ASCII_8BIT)
+        end
+      end
+
+      if pending.bytesize > 0
+        yield(pending, data_bytes, protocol_bytes)
+      end
+
+      return data_bytes, protocol_bytes
+    end
+    private :read_block_mode_transfer
+
+    def read_exact(io, length, destination) # :nodoc:
+      while destination.bytesize < length
+        chunk = io.read(length - destination.bytesize)
+        return false if chunk.nil? || chunk.empty?
+        destination << chunk
+      end
+      true
+    end
+    private :read_exact
+
+    def write_block_mode_header(io, descriptor, size) # :nodoc:
+      io.write([descriptor, size >> 8, size & 0xff].pack("C3"))
+    end
+    private :write_block_mode_header
+
+    def write_restart_marker(io, marker) # :nodoc:
+      marker = marker.to_s
+      written = 0
+      marker.scan(/.{1,#{BLOCK_MAX_SIZE}}/nm) do |part|
+        write_block_mode_header(io, BLOCK_DESCRIPTOR_RESTART_MARKER,
+                                part.bytesize)
+        io.write(part)
+        written += BLOCK_HEADER_SIZE + part.bytesize
+      end
+      written
+    end
+    private :write_restart_marker
+
+    def write_block_mode_transfer(conn, file, blocksize, rest_offset) # :nodoc:
+      data_bytes = 0
+      protocol_bytes = 0
+
+      if rest_offset
+        protocol_bytes += write_restart_marker(conn, rest_offset)
+      end
+
+      while buf = file.read(blocksize)
+        offset = 0
+        while offset < buf.bytesize
+          part = buf.byteslice(offset, BLOCK_MAX_SIZE)
+          write_block_mode_header(conn, 0, part.bytesize)
+          conn.write(part)
+          data_bytes += part.bytesize
+          protocol_bytes += BLOCK_HEADER_SIZE
+          offset += part.bytesize
+        end
+        yield(buf, data_bytes, protocol_bytes) if block_given?
+      end
+
+      write_block_mode_header(conn, BLOCK_DESCRIPTOR_EOF, 0)
+      return data_bytes, protocol_bytes + BLOCK_HEADER_SIZE
+    end
+    private :write_block_mode_transfer
 
     #
     # Writes debug message to the debug output stream
