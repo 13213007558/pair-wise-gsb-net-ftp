@@ -297,6 +297,10 @@ module Net
       @resume = false
       @bare_sock = @sock = NullSocket.new
       @logged_in = false
+      @command_mutex = Monitor.new
+      @abort_mutex = Mutex.new
+      @abort_condition = Thread::ConditionVariable.new
+      @transfer = nil
       @open_timeout = options[:open_timeout]
       @ssl_handshake_timeout = options[:ssl_handshake_timeout]
       @read_timeout = options[:read_timeout] || 60
@@ -522,8 +526,10 @@ module Net
     #
     def sendcmd(cmd)
       synchronize do
-        putline(cmd)
-        return getresp
+        @command_mutex.synchronize do
+          putline(cmd)
+          return getresp
+        end
       end
     end
 
@@ -532,8 +538,10 @@ module Net
     #
     def voidcmd(cmd)
       synchronize do
-        putline(cmd)
-        voidresp
+        @command_mutex.synchronize do
+          putline(cmd)
+          voidresp
+        end
       end
     end
 
@@ -616,13 +624,80 @@ module Net
         end
       end
       if @private_data_connection
-        return BufferedSSLSocket.new(start_tls_session(conn),
+        conn = BufferedSSLSocket.new(start_tls_session(conn),
                                      read_timeout: @read_timeout)
       else
-        return BufferedSocket.new(conn, read_timeout: @read_timeout)
+        conn = BufferedSocket.new(conn, read_timeout: @read_timeout)
       end
+      activate_transfer(conn)
+      return conn
     end
     private :transfercmd
+
+    def begin_transfer
+      @command_mutex.enter
+      @transfer = {
+        status: :setup,
+        connection: nil,
+        response: nil,
+      }
+    end
+    private :begin_transfer
+
+    def end_transfer_setup
+      @command_mutex.exit
+    end
+    private :end_transfer_setup
+
+    def activate_transfer(connection)
+      @abort_mutex.synchronize do
+        if @transfer
+          @transfer[:status] = :active
+          @transfer[:connection] = connection
+          @abort_condition.broadcast
+        end
+      end
+    end
+    private :activate_transfer
+
+    def finish_transfer(error = nil)
+      setup_failed = false
+      @command_mutex.synchronize do
+        @abort_mutex.synchronize do
+          transfer = @transfer
+          if transfer.nil?
+            return
+          elsif transfer[:status] == :setup
+            @transfer = nil
+            @abort_condition.broadcast
+            setup_failed = true
+            return
+          elsif transfer[:status] == :done
+            @transfer = nil
+            response = transfer[:response]
+            if response&.start_with?("426")
+              raise FTPTempError, response
+            end
+            return response
+          elsif error.nil? || error.is_a?(Errno::EPIPE)
+            begin
+              response = getresp
+            rescue Exception
+              @transfer = nil
+              raise
+            end
+            @transfer = nil
+            return response
+          else
+            @transfer = nil
+            return
+          end
+        end
+      end
+    ensure
+      @command_mutex.exit if setup_failed
+    end
+    private :finish_transfer
 
     #
     # Logs in to the remote host.  The session must have been
@@ -666,18 +741,25 @@ module Net
     def retrbinary(cmd, blocksize, rest_offset = nil) # :yield: data
       synchronize do
         with_binary(true) do
+          conn = nil
+          error = nil
+          begin_transfer
           begin
             conn = transfercmd(cmd, rest_offset)
+            end_transfer_setup
             while data = conn.read(blocksize)
               yield(data)
             end
             conn.shutdown(Socket::SHUT_WR) rescue nil
             conn.read_timeout = 1
             conn.read rescue nil
+          rescue Exception
+            error = $!
+            raise
           ensure
             conn.close if conn
+            finish_transfer(error)
           end
-          voidresp
         end
       end
     end
@@ -691,18 +773,25 @@ module Net
     def retrlines(cmd) # :yield: line
       synchronize do
         with_binary(false) do
+          conn = nil
+          error = nil
+          begin_transfer
           begin
             conn = transfercmd(cmd)
+            end_transfer_setup
             while line = conn.gets
               yield(line.sub(/\r?\n\z/, ""), !line.match(/\n\z/).nil?)
             end
             conn.shutdown(Socket::SHUT_WR) rescue nil
             conn.read_timeout = 1
             conn.read rescue nil
+          rescue Exception
+            error = $!
+            raise
           ensure
             conn.close if conn
+            finish_transfer(error)
           end
-          voidresp
         end
       end
     end
@@ -719,8 +808,12 @@ module Net
       end
       synchronize do
         with_binary(true) do
+          conn = nil
+          error = nil
+          begin_transfer
           begin
             conn = transfercmd(cmd)
+            end_transfer_setup
             while buf = file.read(blocksize)
               conn.write(buf)
               yield(buf) if block_given?
@@ -728,19 +821,15 @@ module Net
             conn.shutdown(Socket::SHUT_WR) rescue nil
             conn.read_timeout = 1
             conn.read rescue nil
+          rescue Exception
+            error = $!
+            raise
           ensure
             conn.close if conn
+            finish_transfer(error)
           end
-          voidresp
         end
       end
-    rescue Errno::EPIPE
-      # EPIPE, in this case, means that the data connection was unexpectedly
-      # terminated.  Rather than just raising EPIPE to the caller, check the
-      # response on the control connection.  If getresp doesn't raise a more
-      # appropriate exception, re-raise the original exception.
-      getresp
-      raise
     end
 
     #
@@ -752,8 +841,13 @@ module Net
     def storlines(cmd, file) # :yield: line
       synchronize do
         with_binary(false) do
+          conn = nil
+          error = nil
+          response = nil
+          begin_transfer
           begin
             conn = transfercmd(cmd)
+            end_transfer_setup
             while buf = file.gets
               if buf[-2, 2] != CRLF
                 buf = buf.chomp + CRLF
@@ -764,19 +858,16 @@ module Net
             conn.shutdown(Socket::SHUT_WR) rescue nil
             conn.read_timeout = 1
             conn.read rescue nil
+          rescue Exception
+            error = $!
+            raise
           ensure
             conn.close if conn
+            response = finish_transfer(error)
           end
-          getresp # The response might be important when connected to a mainframe
+          response
         end
       end
-    rescue Errno::EPIPE
-      # EPIPE, in this case, means that the data connection was unexpectedly
-      # terminated.  Rather than just raising EPIPE to the caller, check the
-      # response on the control connection.  If getresp doesn't raise a more
-      # appropriate exception, re-raise the original exception.
-      getresp
-      raise
     end
 
     #
@@ -1279,17 +1370,75 @@ module Net
 
     #
     # Aborts the previous command (ABOR command).
+    # Returns +true+ when a transfer was interrupted with a 426 response,
+    # and +false+ when no active transfer remained to abort.
     #
     def abort
-      line = "ABOR" + CRLF
-      debug_print "put: ABOR"
-      @sock.send(line, Socket::MSG_OOB)
-      resp = getmultiline
-      unless ["426", "226", "225"].include?(resp[0, 3])
-        raise FTPProtoError, resp
+      @abort_mutex.synchronize do
+        while @transfer && @transfer[:status] == :setup
+          @abort_condition.wait(@abort_mutex)
+        end
       end
-      return resp
+
+      @command_mutex.synchronize do
+        active_transfer = false
+        @abort_mutex.synchronize do
+          transfer = @transfer
+          active_transfer = !transfer.nil?
+        end
+        begin
+          line = "ABOR" + CRLF
+          debug_print "put: ABOR"
+          @sock.send(line, Socket::MSG_OOB)
+          first_response = getmultiline
+          case first_response[0, 3]
+          when "426"
+            second_response = getmultiline
+            unless second_response.start_with?("226")
+              raise FTPProtoError, second_response
+            end
+            @abort_mutex.synchronize do
+              complete_aborted_transfer_locked(first_response)
+            end
+            return true
+          when "226"
+            if active_transfer
+              second_response = getmultiline
+              unless second_response.start_with?("225")
+                raise FTPProtoError, second_response
+              end
+              @abort_mutex.synchronize do
+                complete_aborted_transfer_locked(first_response)
+              end
+            end
+            return false
+          when "225"
+            return false
+          else
+            raise FTPProtoError, first_response
+          end
+        rescue Exception
+          invalidate_connection
+          raise
+        end
+      end
     end
+
+    def complete_aborted_transfer_locked(response)
+      if @transfer
+        @transfer[:status] = :done
+        @transfer[:response] = response
+        @abort_condition.broadcast
+      end
+    end
+    private :complete_aborted_transfer_locked
+
+    def invalidate_connection
+      connection = @abort_mutex.synchronize { @transfer&.dig(:connection) }
+      connection&.close rescue nil
+      @bare_sock.close rescue nil
+    end
+    private :invalidate_connection
 
     #
     # Returns the status (STAT command).

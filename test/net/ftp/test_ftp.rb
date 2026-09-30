@@ -6,6 +6,7 @@ require "ostruct"
 require "stringio"
 require "tempfile"
 require "tmpdir"
+require "thread"
 
 class FTPTest < Test::Unit::TestCase
   SERVER_NAME = "localhost"
@@ -1234,35 +1235,151 @@ EOF
   end
 
   def test_abort
-    commands = []
-    server = create_ftp_server { |sock|
-      sock.print("220 (test_ftp).\r\n")
-      commands.push(sock.gets)
-      sock.print("331 Please specify the password.\r\n")
-      commands.push(sock.gets)
-      sock.print("230 Login successful.\r\n")
-      commands.push(sock.gets)
-      sock.print("200 Switching to Binary mode.\r\n")
-      commands.push(sock.gets)
-      sock.print("225 No transfer to ABOR.\r\n")
-    }
-    begin
-      begin
-        ftp = Net::FTP.new
-        ftp.connect(SERVER_ADDR, server.port)
-        ftp.login
-        assert_match(/\AUSER /, commands.shift)
-        assert_match(/\APASS /, commands.shift)
-        assert_equal("TYPE I\r\n", commands.shift)
-        ftp.abort
-        assert_equal("ABOR\r\n", commands.shift)
-        assert_equal(nil, commands.shift)
-      ensure
-        ftp.close if ftp
-      end
-    ensure
-      server.close
+    commands = Queue.new
+    ftp, control, peer = create_ftp_control_pair
+    peer_thread = Thread.start do
+      commands.push(control.gets)
+      control.print("225 No transfer to ABOR.\r\n")
+      commands.push(control.gets)
+      control.print("200 NOOP command successful.\r\n")
     end
+    begin
+      assert_equal(false, ftp.abort)
+      assert_equal("ABOR\r\n", commands.pop)
+      ftp.noop
+      assert_equal("NOOP\r\n", commands.pop)
+    ensure
+      control.close
+      ftp.close
+      peer.close
+      peer_thread.join
+    end
+  end
+
+  def test_abort_transfer_426_226
+    commands = Queue.new
+    data_chunk_received = Queue.new
+    binary_data = "0123456789abcdef"
+    ftp, control, peer, data, data_peer = create_ftp_transfer_pair
+    ftp.read_timeout = 0.1
+    peer_thread = Thread.start do
+      data.print(binary_data)
+      commands.push(control.gets)
+      control.print("426 Connection closed; transfer aborted.\r\n")
+      control.print("226 Abort command successful.\r\n")
+      data.close
+      commands.push(control.gets)
+      control.print("200 NOOP command successful.\r\n")
+    end
+    transfer_thread = Thread.start do
+      ftp.retrbinary("RETR foo", binary_data.bytesize) do |chunk|
+        data_chunk_received.push(chunk)
+      end
+    end
+    transfer_thread.report_on_exception = false
+    assert_equal(binary_data, data_chunk_received.pop)
+    assert_equal(true, ftp.abort)
+    assert_raise(Net::FTPTempError) { transfer_thread.join }
+    assert_equal("ABOR\r\n", commands.pop)
+    assert_nil(ftp.noop)
+    assert_equal("NOOP\r\n", commands.pop)
+  ensure
+    control.close
+    data.close
+    ftp.close if ftp && !ftp.closed?
+    [peer, data_peer].each(&:close)
+    peer_thread&.join
+  end
+
+  def test_abort_read_timeout_closes_connection
+    ftp, control, peer, data, data_socket = create_ftp_transfer_pair
+    ftp.read_timeout = 0.01
+    data_reading = Queue.new
+    data_socket.define_singleton_method(:read) do |*args, &block|
+      data_reading.push(true)
+      super(*args, &block)
+    end
+    peer_thread = Thread.start do
+      control.gets
+    end
+    transfer_thread = Thread.start do
+      ftp.retrbinary("RETR foo", 8) { }
+    end
+    transfer_thread.report_on_exception = false
+    data_reading.pop
+    assert_raise(Net::ReadTimeout) { ftp.abort }
+    assert_equal(true, ftp.closed?)
+    assert_raise(IOError) { transfer_thread.join }
+  ensure
+    control&.close
+    data&.close
+    ftp.close if ftp && !ftp.closed?
+    peer&.close
+    peer_thread&.join
+  end
+
+  def test_abort_disconnect_closes_connection
+    ftp, control, peer, data, data_socket = create_ftp_transfer_pair
+    data_reading = Queue.new
+    data_socket.define_singleton_method(:read) do |*args, &block|
+      data_reading.push(true)
+      super(*args, &block)
+    end
+    peer_thread = Thread.start do
+      control.gets
+      control.close
+    end
+    transfer_thread = Thread.start do
+      ftp.retrbinary("RETR foo", 8) { }
+    end
+    transfer_thread.report_on_exception = false
+    data_reading.pop
+    assert_raise(EOFError) { ftp.abort }
+    assert_equal(true, ftp.closed?)
+    assert_raise(IOError) { transfer_thread.join }
+  ensure
+    control&.close
+    data&.close
+    ftp.close if ftp && !ftp.closed?
+    peer&.close
+    peer_thread&.join
+  end
+
+  def test_abort_completed_transfer_226_225
+    commands = Queue.new
+    data_chunk_received = Queue.new
+    binary_data = "0123456789abcdef"
+    ftp, control, peer, data, data_peer = create_ftp_transfer_pair
+    peer_thread = Thread.start do
+      data.print(binary_data)
+      data.close
+      control.print("226 Transfer complete.\r\n")
+      commands.push(control.gets)
+      control.print("225 No transfer to ABOR.\r\n")
+      commands.push(control.gets)
+      control.print("257 \"/\" is current directory.\r\n")
+    end
+    received = String.new
+    transfer_thread = Thread.start do
+      ftp.retrbinary("RETR foo", binary_data.bytesize) do |chunk|
+        received << chunk
+        data_chunk_received.push(chunk)
+      end
+    end
+    transfer_thread.report_on_exception = false
+    data_chunk_received.pop
+    assert_equal(false, ftp.abort)
+    transfer_thread.join
+    assert_equal(binary_data, received)
+    assert_equal("ABOR\r\n", commands.pop)
+    assert_equal("/", ftp.pwd)
+    assert_equal("PWD\r\n", commands.pop)
+  ensure
+    control.close
+    data.close
+    ftp.close if ftp && !ftp.closed?
+    [peer, data_peer].each(&:close)
+    peer_thread&.join
   end
 
   def test_status
@@ -2256,7 +2373,7 @@ EOF
         assert_match(/\AUSER /, commands.shift)
         assert_match(/\APASS /, commands.shift)
         assert_equal("TYPE I\r\n", commands.shift)
-        ftp.abort
+        assert_equal(false, ftp.abort)
         assert_equal("ABOR\r\n", commands.shift)
         assert_equal(nil, commands.shift)
       rescue RuntimeError, LoadError
@@ -2672,6 +2789,29 @@ EOF
   end
 
   private
+
+  def create_ftp_control_pair
+    client_control, server_control = Socket.pair(:UNIX, :STREAM, 0)
+    ftp = Net::FTP.new
+    socket = Net::FTP::BufferedSocket.new(client_control)
+    socket.define_singleton_method(:send) do |message, _flags|
+      write(message)
+    end
+    ftp.instance_variable_set(:@bare_sock, client_control)
+    ftp.set_socket(socket, false)
+    return ftp, server_control, client_control
+  end
+
+  def create_ftp_transfer_pair
+    ftp, server_control, client_control = create_ftp_control_pair
+    client_data, server_data = Socket.pair(:UNIX, :STREAM, 0)
+    data_socket = Net::FTP::BufferedSocket.new(client_data)
+    ftp.define_singleton_method(:transfercmd) do |*|
+      ftp.send(:activate_transfer, data_socket)
+      data_socket
+    end
+    return ftp, server_control, client_control, server_data, data_socket
+  end
 
   def create_ftp_server(sleep_time = nil, addr = SERVER_ADDR)
     server = TCPServer.new(addr, 0)
