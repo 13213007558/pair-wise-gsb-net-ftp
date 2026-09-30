@@ -93,11 +93,35 @@ module Net
     FTP_PORT = 21
     CRLF = "\r\n"
     DEFAULT_BLOCKSIZE = BufferedIO::BUFSIZE
+    STREAM_MODE = "S" # :nodoc:
+    BLOCK_MODE = "B" # :nodoc:
+    # Size in bytes of an RFC 959 block mode block header.
+    BLOCK_HEADER_SIZE = 3
+    # Maximum byte count representable in a block mode block header.
+    MAX_BLOCK_COUNT = 0xffff
+    # Block descriptor bit: end of record.
+    BLOCK_DESCRIPTOR_EOR = 0x80
+    # Block descriptor bit: end of file.
+    BLOCK_DESCRIPTOR_EOF = 0x40
+    # Block descriptor bit: suspected errors.
+    BLOCK_DESCRIPTOR_ERRORS = 0x20
+    # Block descriptor bit: restart marker.
+    BLOCK_DESCRIPTOR_RESTART = 0x10
     @@default_passive = true
     # :startdoc:
 
     # When +true+, transfers are performed in binary mode.  Default: +true+.
     attr_reader :binary
+
+    # The transfer mode: +:stream+ (RFC 959 stream mode, the default) or
+    # +:block+ (RFC 959 block mode).  Block mode frames binary transfers
+    # with three-byte block headers carrying descriptor bits (end of
+    # record, end of file, suspected errors, restart marker) and a
+    # sixteen-bit byte count, so the end of a transfer is determined by
+    # the end-of-file descriptor instead of the close of the data
+    # connection.  Block mode only affects binary transfers; text
+    # transfers are always done in stream mode.
+    attr_reader :transfer_mode
 
     # When +true+, the connection is in passive mode.  Default: +true+.
     attr_accessor :passive
@@ -283,6 +307,7 @@ module Net
         @implicit_ftps = false
       end
       @binary = true
+      @transfer_mode = STREAM_MODE
       if options[:passive].nil?
         @passive = @@default_passive
       else
@@ -318,6 +343,31 @@ module Net
       end
     end
 
+    # A setter to select the transfer mode.  +newmode+ is one of
+    # +:stream+ (or <tt>"S"</tt>) and +:block+ (or <tt>"B"</tt>).
+    # When the session is logged in and the mode changes, the
+    # corresponding MODE command is sent to the server.
+    def transfer_mode=(newmode)
+      newmode = FTP.normalize_transfer_mode(newmode)
+      if newmode != @transfer_mode
+        @transfer_mode = newmode
+        send_mode_command if @logged_in
+      end
+    end
+
+    # Normalizes a transfer mode name to "S" or "B".  Accepts
+    # +:stream+/+:block+ symbols and "stream"/"block"/"S"/"B" strings.
+    def FTP.normalize_transfer_mode(mode) # :nodoc:
+      case mode.to_s.downcase
+      when "s", "stream"
+        STREAM_MODE
+      when "b", "block"
+        BLOCK_MODE
+      else
+        raise ArgumentError, "unknown transfer mode: #{mode.inspect}"
+      end
+    end
+
     # Sends a command to destination host, with the current binary sendmode
     # type.
     #
@@ -331,6 +381,32 @@ module Net
       end
     end
     private :send_type_command
+
+    # Sends a MODE command with the current transfer mode.
+    def send_mode_command # :nodoc:
+      voidcmd("MODE " + @transfer_mode)
+    end
+    private :send_mode_command
+
+    # Whether binary transfers use RFC 959 block mode framing.
+    def block_mode? # :nodoc:
+      @transfer_mode == BLOCK_MODE
+    end
+    private :block_mode?
+
+    # Toggles the transfer mode and yields to a block.
+    # This preserves your current transfer mode, but allows a temporary
+    # transaction with transfer mode of +newmode+.
+    def with_transfer_mode(newmode) # :nodoc:
+      oldmode = transfer_mode
+      self.transfer_mode = newmode
+      begin
+        yield
+      ensure
+        self.transfer_mode = oldmode
+      end
+    end
+    private :with_transfer_mode
 
     # Toggles transfers in binary mode and yields to a block.
     # This preserves your current binary send mode, but allows a temporary
@@ -654,6 +730,7 @@ module Net
       end
       @welcome = resp
       send_type_command
+      send_mode_command if @transfer_mode != STREAM_MODE
       @logged_in = true
     end
 
@@ -668,8 +745,14 @@ module Net
         with_binary(true) do
           begin
             conn = transfercmd(cmd, rest_offset)
-            while data = conn.read(blocksize)
-              yield(data)
+            if block_mode?
+              retrbinary_blocks(conn) do |data|
+                yield(data)
+              end
+            else
+              while data = conn.read(blocksize)
+                yield(data)
+              end
             end
             conn.shutdown(Socket::SHUT_WR) rescue nil
             conn.read_timeout = 1
@@ -682,6 +765,53 @@ module Net
       end
     end
 
+    # Reads RFC 959 block mode framed data from +conn+, yielding the
+    # payload of each data block.  The transfer ends when a block with
+    # the end-of-file descriptor bit is received, not when the
+    # connection closes.  Only payload bytes are yielded, so progress
+    # reported through the yielded chunks reflects actual data bytes
+    # and excludes protocol overhead (block headers and restart
+    # markers).
+    def retrbinary_blocks(conn) # :nodoc:
+      loop do
+        header = read_block_bytes(conn, BLOCK_HEADER_SIZE)
+        if header.bytesize < BLOCK_HEADER_SIZE
+          raise FTPProtoError,
+                "truncated block header: data connection closed before an end-of-file block was received"
+        end
+        descriptor, count = header.unpack("Cn")
+        if descriptor & BLOCK_DESCRIPTOR_ERRORS != 0
+          raise FTPProtoError,
+                sprintf("server indicated suspected errors in block (descriptor 0x%02x)", descriptor)
+        end
+        data = count > 0 ? read_block_bytes(conn, count) : String.new
+        if data.bytesize < count
+          raise FTPProtoError,
+                "truncated block: expected #{count} bytes, got #{data.bytesize}"
+        end
+        if descriptor & BLOCK_DESCRIPTOR_RESTART == 0 && !data.empty?
+          yield(data)
+        end
+        break if descriptor & BLOCK_DESCRIPTOR_EOF != 0
+      end
+    end
+    private :retrbinary_blocks
+
+    # Reads exactly +length+ bytes from +conn+, looping over short
+    # reads so that network segmentation is never mistaken for a
+    # block boundary.  Returns fewer than +length+ bytes only when
+    # the connection reaches end of file.
+    def read_block_bytes(conn, length) # :nodoc:
+      str = String.new
+      while str.bytesize < length
+        chunk = conn.read(length - str.bytesize)
+        break unless chunk
+        str << chunk
+      end
+      str
+    end
+    private :read_block_bytes
+
     #
     # Puts the connection into ASCII (text) mode, issues the given command, and
     # passes the resulting data, one line at a time, to the associated block. If
@@ -691,18 +821,20 @@ module Net
     def retrlines(cmd) # :yield: line
       synchronize do
         with_binary(false) do
-          begin
-            conn = transfercmd(cmd)
-            while line = conn.gets
-              yield(line.sub(/\r?\n\z/, ""), !line.match(/\n\z/).nil?)
+          with_transfer_mode(STREAM_MODE) do
+            begin
+              conn = transfercmd(cmd)
+              while line = conn.gets
+                yield(line.sub(/\r?\n\z/, ""), !line.match(/\n\z/).nil?)
+              end
+              conn.shutdown(Socket::SHUT_WR) rescue nil
+              conn.read_timeout = 1
+              conn.read rescue nil
+            ensure
+              conn.close if conn
             end
-            conn.shutdown(Socket::SHUT_WR) rescue nil
-            conn.read_timeout = 1
-            conn.read rescue nil
-          ensure
-            conn.close if conn
+            voidresp
           end
-          voidresp
         end
       end
     end
@@ -721,9 +853,15 @@ module Net
         with_binary(true) do
           begin
             conn = transfercmd(cmd)
-            while buf = file.read(blocksize)
-              conn.write(buf)
-              yield(buf) if block_given?
+            if block_mode?
+              storbinary_blocks(conn, file, blocksize) do |buf|
+                yield(buf) if block_given?
+              end
+            else
+              while buf = file.read(blocksize)
+                conn.write(buf)
+                yield(buf) if block_given?
+              end
             end
             conn.shutdown(Socket::SHUT_WR) rescue nil
             conn.read_timeout = 1
@@ -743,6 +881,24 @@ module Net
       raise
     end
 
+    # Sends the contents of +file+ to +conn+ framed as RFC 959 block
+    # mode blocks: each chunk is prefixed with a three-byte header
+    # (descriptor byte and sixteen-bit byte count), and the transfer
+    # is terminated by an empty block with the end-of-file descriptor
+    # bit.  Only payload bytes are yielded, so progress reported
+    # through the yielded chunks reflects actual data bytes and
+    # excludes protocol overhead (block headers).
+    def storbinary_blocks(conn, file, blocksize) # :nodoc:
+      blocksize = MAX_BLOCK_COUNT if blocksize > MAX_BLOCK_COUNT
+      while buf = file.read(blocksize)
+        conn.write([0, buf.bytesize].pack("Cn"))
+        conn.write(buf)
+        yield(buf) if block_given?
+      end
+      conn.write([BLOCK_DESCRIPTOR_EOF, 0].pack("Cn"))
+    end
+    private :storbinary_blocks
+
     #
     # Puts the connection into ASCII (text) mode, issues the given server-side
     # command (such as "STOR myfile"), and sends the contents of the file
@@ -752,22 +908,24 @@ module Net
     def storlines(cmd, file) # :yield: line
       synchronize do
         with_binary(false) do
-          begin
-            conn = transfercmd(cmd)
-            while buf = file.gets
-              if buf[-2, 2] != CRLF
-                buf = buf.chomp + CRLF
+          with_transfer_mode(STREAM_MODE) do
+            begin
+              conn = transfercmd(cmd)
+              while buf = file.gets
+                if buf[-2, 2] != CRLF
+                  buf = buf.chomp + CRLF
+                end
+                conn.write(buf)
+                yield(buf) if block_given?
               end
-              conn.write(buf)
-              yield(buf) if block_given?
+              conn.shutdown(Socket::SHUT_WR) rescue nil
+              conn.read_timeout = 1
+              conn.read rescue nil
+            ensure
+              conn.close if conn
             end
-            conn.shutdown(Socket::SHUT_WR) rescue nil
-            conn.read_timeout = 1
-            conn.read rescue nil
-          ensure
-            conn.close if conn
+            getresp # The response might be important when connected to a mainframe
           end
-          getresp # The response might be important when connected to a mainframe
         end
       end
     rescue Errno::EPIPE
