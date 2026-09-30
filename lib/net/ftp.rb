@@ -296,6 +296,9 @@ module Net
       @debug_output = $stdout
       @resume = false
       @bare_sock = @sock = NullSocket.new
+      @control_mutex = Monitor.new
+      @transfer_active = false
+      @transfer_response = nil
       @logged_in = false
       @open_timeout = options[:open_timeout]
       @ssl_handshake_timeout = options[:ssl_handshake_timeout]
@@ -432,8 +435,10 @@ module Net
     def set_socket(sock, get_greeting = true)
       synchronize do
         @sock = sock
+        @transfer_active = false
+        @transfer_response = nil
         if get_greeting
-          voidresp
+          @control_mutex.synchronize { voidresp }
         end
       end
     end
@@ -522,8 +527,10 @@ module Net
     #
     def sendcmd(cmd)
       synchronize do
-        putline(cmd)
-        return getresp
+        @control_mutex.synchronize do
+          putline(cmd)
+          return getresp
+        end
       end
     end
 
@@ -532,10 +539,38 @@ module Net
     #
     def voidcmd(cmd)
       synchronize do
-        putline(cmd)
-        voidresp
+        @control_mutex.synchronize do
+          putline(cmd)
+          voidresp
+        end
       end
     end
+
+    def finish_transfer # :nodoc:
+      @control_mutex.synchronize do
+        handled_response = !@transfer_response.nil?
+        begin
+          resp = @transfer_response || getresp
+          @last_response = resp
+          @last_response_code = resp[0, 3]
+          if handled_response
+            case @last_response_code
+            when /\A4/
+              raise FTPTempError, resp
+            when /\A5/
+              raise FTPPermError, resp
+            end
+          end
+          if !resp.start_with?("2")
+            raise FTPReplyError, resp
+          end
+        ensure
+          @transfer_response = nil
+          @transfer_active = false
+        end
+      end
+    end
+    private :finish_transfer
 
     # Constructs and send the appropriate PORT (or EPRT) command
     def sendport(host, port) # :nodoc:
@@ -581,11 +616,20 @@ module Net
               raise FTPReplyError, resp
             end
           end
-          resp = sendcmd(cmd)
-          # skip 2XX for some ftp servers
-          resp = getresp if resp.start_with?("2")
-          if !resp.start_with?("1")
-            raise FTPReplyError, resp
+          @control_mutex.synchronize do
+            @transfer_active = true
+            begin
+              putline(cmd)
+              resp = getresp
+              # skip 2XX for some ftp servers
+              resp = getresp if resp.start_with?("2")
+              if !resp.start_with?("1")
+                raise FTPReplyError, resp
+              end
+            rescue
+              @transfer_active = false
+              raise
+            end
           end
           succeeded = true
         ensure
@@ -602,24 +646,44 @@ module Net
               raise FTPReplyError, resp
             end
           end
-          resp = sendcmd(cmd)
-          # skip 2XX for some ftp servers
-          resp = getresp if resp.start_with?("2")
-          if !resp.start_with?("1")
-            raise FTPReplyError, resp
+          @control_mutex.synchronize do
+            @transfer_active = true
+            begin
+              putline(cmd)
+              resp = getresp
+              # skip 2XX for some ftp servers
+              resp = getresp if resp.start_with?("2")
+              if !resp.start_with?("1")
+                raise FTPReplyError, resp
+              end
+            rescue
+              @transfer_active = false
+              raise
+            end
           end
-          conn, = sock.accept
+          begin
+            conn, = sock.accept
+          rescue
+            @transfer_active = false
+            raise
+          end
           sock.shutdown(Socket::SHUT_WR) rescue nil
           sock.read rescue nil
         ensure
           sock.close
         end
       end
-      if @private_data_connection
-        return BufferedSSLSocket.new(start_tls_session(conn),
-                                     read_timeout: @read_timeout)
-      else
-        return BufferedSocket.new(conn, read_timeout: @read_timeout)
+      begin
+        if @private_data_connection
+          return BufferedSSLSocket.new(start_tls_session(conn),
+                                       read_timeout: @read_timeout)
+        else
+          return BufferedSocket.new(conn, read_timeout: @read_timeout)
+        end
+      rescue
+        @transfer_active = false
+        conn.close
+        raise
       end
     end
     private :transfercmd
@@ -677,7 +741,7 @@ module Net
           ensure
             conn.close if conn
           end
-          voidresp
+          finish_transfer
         end
       end
     end
@@ -702,7 +766,7 @@ module Net
           ensure
             conn.close if conn
           end
-          voidresp
+          finish_transfer
         end
       end
     end
@@ -731,7 +795,7 @@ module Net
           ensure
             conn.close if conn
           end
-          voidresp
+          finish_transfer
         end
       end
     rescue Errno::EPIPE
@@ -739,7 +803,7 @@ module Net
       # terminated.  Rather than just raising EPIPE to the caller, check the
       # response on the control connection.  If getresp doesn't raise a more
       # appropriate exception, re-raise the original exception.
-      getresp
+      finish_transfer
       raise
     end
 
@@ -767,7 +831,7 @@ module Net
           ensure
             conn.close if conn
           end
-          getresp # The response might be important when connected to a mainframe
+          finish_transfer # The response might be important when connected to a mainframe
         end
       end
     rescue Errno::EPIPE
@@ -775,7 +839,7 @@ module Net
       # terminated.  Rather than just raising EPIPE to the caller, check the
       # response on the control connection.  If getresp doesn't raise a more
       # appropriate exception, re-raise the original exception.
-      getresp
+      finish_transfer
       raise
     end
 
@@ -1280,15 +1344,52 @@ module Net
     #
     # Aborts the previous command (ABOR command).
     #
+    # Returns the transfer completion response: "426" when the transfer is
+    # aborted, or "226" when it completed just before ABOR was processed.
+    # "225" is returned when there is no transfer to abort.
+    #
     def abort
       line = "ABOR" + CRLF
       debug_print "put: ABOR"
-      @sock.send(line, Socket::MSG_OOB)
-      resp = getmultiline
-      unless ["426", "226", "225"].include?(resp[0, 3])
-        raise FTPProtoError, resp
+      @control_mutex.synchronize do
+        begin
+          @sock.send(line, Socket::MSG_OOB)
+          resp = getmultiline
+          code = resp[0, 3]
+          if @transfer_active && code == "426"
+            transfer_resp = resp
+            resp = getmultiline
+            code = resp[0, 3]
+            unless code == "226"
+              raise FTPProtoError, resp
+            end
+            @transfer_response = transfer_resp
+            return transfer_resp
+          elsif @transfer_active && code == "226"
+            transfer_resp = resp
+            abor_resp = getmultiline
+            unless abor_resp.start_with?("225")
+              raise FTPProtoError, abor_resp
+            end
+            @transfer_response = transfer_resp
+            return transfer_resp
+          elsif code == "225" || (!@transfer_active && ["426", "226"].include?(code))
+            return resp
+          else
+            raise FTPProtoError, resp
+          end
+        rescue StandardError
+          @transfer_active = false
+          @transfer_response = nil
+          begin
+            @sock.close
+          rescue StandardError
+            nil
+          end
+          @sock = NullSocket.new
+          raise
+        end
       end
-      return resp
     end
 
     #
@@ -1303,8 +1404,10 @@ module Net
         raise ArgumentError, "A line must not contain CR or LF"
       end
       debug_print "put: #{line}"
-      @sock.send(line + CRLF, Socket::MSG_OOB)
-      return getresp
+      @control_mutex.synchronize do
+        @sock.send(line + CRLF, Socket::MSG_OOB)
+        return getresp
+      end
     end
 
     #
@@ -1396,13 +1499,15 @@ module Net
     #
     def close
       if @sock and not @sock.closed?
-        begin
-          @sock.shutdown(Socket::SHUT_WR) rescue nil
-          orig, self.read_timeout = self.read_timeout, 3
-          @sock.read rescue nil
-        ensure
-          @sock.close
-          self.read_timeout = orig
+        @control_mutex.synchronize do
+          begin
+            @sock.shutdown(Socket::SHUT_WR) rescue nil
+            orig, self.read_timeout = self.read_timeout, 3
+            @sock.read rescue nil
+          ensure
+            @sock.close
+            self.read_timeout = orig
+          end
         end
       end
     end

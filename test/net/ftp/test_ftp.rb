@@ -1245,6 +1245,10 @@ EOF
       sock.print("200 Switching to Binary mode.\r\n")
       commands.push(sock.gets)
       sock.print("225 No transfer to ABOR.\r\n")
+      commands.push(sock.gets)
+      sock.print("200 NOOP command successful.\r\n")
+      commands.push(sock.gets)
+      sock.print(%Q{257 \"/home/test\" is current directory.\r\n})
     }
     begin
       begin
@@ -1256,11 +1260,223 @@ EOF
         assert_equal("TYPE I\r\n", commands.shift)
         ftp.abort
         assert_equal("ABOR\r\n", commands.shift)
+        ftp.noop
+        assert_equal("/home/test", ftp.pwd)
+        assert_equal("NOOP\r\n", commands.shift)
+        assert_equal("PWD\r\n", commands.shift)
         assert_equal(nil, commands.shift)
       ensure
         ftp.close if ftp
       end
     ensure
+      server.close
+    end
+  end
+
+  def test_abort_transfer_426_226
+    commands = Queue.new
+    data_accepted = Queue.new
+    abort_resp = nil
+    server = create_ftp_server { |sock|
+      sock.print("220 (test_ftp).\r\n")
+      commands.push(sock.gets)
+      sock.print("331 Please specify the password.\r\n")
+      commands.push(sock.gets)
+      sock.print("230 Login successful.\r\n")
+      commands.push(sock.gets)
+      sock.print("200 Switching to Binary mode.\r\n")
+      line = sock.gets
+      commands.push(line)
+      host, port = process_port_or_eprt(sock, line)
+      commands.push(sock.gets)
+      sock.print("150 Opening BINARY mode data connection.\r\n")
+      data = TCPSocket.new(host, port)
+      data_accepted.pop
+      data.print("x")
+      commands.push(sock.gets)
+      sock.print("426 Connection closed; transfer aborted.\r\n")
+      sock.print("226 Abort command successful.\r\n")
+      data.close
+      commands.push(sock.gets)
+      sock.print("200 NOOP command successful.\r\n")
+      commands.push(sock.gets)
+      sock.print(%Q{257 "/home/test" is current directory.\r\n})
+    }
+    begin
+      ftp = Net::FTP.new
+      ftp.connect(SERVER_ADDR, server.port)
+      ftp.login
+      transfer = Thread.start do
+        ftp.retrbinary("RETR foo", 16) do
+          data_accepted.push(true)
+          abort_resp = ftp.abort
+        end
+      end
+      assert_raise(Net::FTPTempError) { transfer.join }
+      assert_equal("426", abort_resp[0, 3])
+      ftp.noop
+      assert_equal("/home/test", ftp.pwd)
+      assert_equal("USER anonymous\r\n", commands.pop)
+      assert_equal("PASS anonymous@\r\n", commands.pop)
+      assert_equal("TYPE I\r\n", commands.pop)
+      assert_match(/\A(PORT|EPRT) /, commands.pop)
+      assert_equal("RETR foo\r\n", commands.pop)
+      assert_equal("ABOR\r\n", commands.pop)
+      assert_equal("NOOP\r\n", commands.pop)
+      assert_equal("PWD\r\n", commands.pop)
+    ensure
+      transfer.kill if transfer&.alive?
+      ftp.close if ftp
+      server.close
+    end
+  end
+
+  def test_abort_after_transfer_completed_226_225
+    commands = Queue.new
+    abort_resp = nil
+    server = create_ftp_server { |sock|
+      sock.print("220 (test_ftp).\r\n")
+      commands.push(sock.gets)
+      sock.print("331 Please specify the password.\r\n")
+      commands.push(sock.gets)
+      sock.print("230 Login successful.\r\n")
+      commands.push(sock.gets)
+      sock.print("200 Switching to Binary mode.\r\n")
+      line = sock.gets
+      commands.push(line)
+      host, port = process_port_or_eprt(sock, line)
+      commands.push(sock.gets)
+      sock.print("150 Opening BINARY mode data connection.\r\n")
+      data = TCPSocket.new(host, port)
+      data.print("aborted?")
+      data.close
+      sock.print("226 Transfer complete.\r\n")
+      commands.push(sock.gets)
+      sock.print("225 ABOR command successful.\r\n")
+      commands.push(sock.gets)
+      sock.print("200 NOOP command successful.\r\n")
+      commands.push(sock.gets)
+      sock.print(%Q{257 "/home/test" is current directory.\r\n})
+    }
+    begin
+      ftp = Net::FTP.new
+      ftp.connect(SERVER_ADDR, server.port)
+      ftp.login
+      transferred = String.new
+      transfer = Thread.start do
+        ftp.retrbinary("RETR foo", 16) do |chunk|
+          transferred << chunk
+          abort_resp = ftp.abort
+        end
+      end
+      transfer.join
+      assert_equal("226", abort_resp[0, 3])
+      assert_equal("aborted?", transferred)
+      ftp.noop
+      assert_equal("/home/test", ftp.pwd)
+      assert_equal("USER anonymous\r\n", commands.pop)
+      assert_equal("PASS anonymous@\r\n", commands.pop)
+      assert_equal("TYPE I\r\n", commands.pop)
+      assert_match(/\A(PORT|EPRT) /, commands.pop)
+      assert_equal("RETR foo\r\n", commands.pop)
+      assert_equal("ABOR\r\n", commands.pop)
+      assert_equal("NOOP\r\n", commands.pop)
+      assert_equal("PWD\r\n", commands.pop)
+    ensure
+      transfer.kill if transfer&.alive?
+      ftp.close if ftp
+      server.close
+    end
+  end
+
+  def test_abort_read_timeout_closes_connection
+    commands = Queue.new
+    data_accepted = Queue.new
+    transfer_reading = Queue.new
+    server = create_ftp_server { |sock|
+      sock.print("220 (test_ftp).\r\n")
+      commands.push(sock.gets)
+      sock.print("331 Please specify the password.\r\n")
+      commands.push(sock.gets)
+      sock.print("230 Login successful.\r\n")
+      commands.push(sock.gets)
+      sock.print("200 Switching to Binary mode.\r\n")
+      line = sock.gets
+      commands.push(line)
+      host, port = process_port_or_eprt(sock, line)
+      commands.push(sock.gets)
+      sock.print("150 Opening BINARY mode data connection.\r\n")
+      data = TCPSocket.new(host, port)
+      data_accepted.pop
+      data.print("x")
+      commands.push(sock.gets)
+      data.close
+    }
+    begin
+      ftp = Net::FTP.new
+      ftp.read_timeout = 0.2
+      ftp.connect(SERVER_ADDR, server.port)
+      ftp.login
+      transfer = Thread.start do
+        ftp.retrbinary("RETR foo", 16) do
+          transfer_reading.push(true)
+        end
+      end
+      data_accepted.push(true)
+      transfer_reading.pop
+      assert_raise(Net::ReadTimeout) { ftp.abort }
+      assert_equal(true, ftp.closed?)
+      assert_raise(Net::FTPConnectionError) { ftp.noop }
+      assert_raise(IOError, SystemCallError) { transfer.join }
+    ensure
+      transfer.kill if transfer&.alive?
+      ftp.close if ftp
+      server.close
+    end
+  end
+
+  def test_abort_disconnect_closes_connection
+    commands = Queue.new
+    data_accepted = Queue.new
+    transfer_reading = Queue.new
+    server = create_ftp_server { |sock|
+      sock.print("220 (test_ftp).\r\n")
+      commands.push(sock.gets)
+      sock.print("331 Please specify the password.\r\n")
+      commands.push(sock.gets)
+      sock.print("230 Login successful.\r\n")
+      commands.push(sock.gets)
+      sock.print("200 Switching to Binary mode.\r\n")
+      line = sock.gets
+      commands.push(line)
+      host, port = process_port_or_eprt(sock, line)
+      commands.push(sock.gets)
+      sock.print("150 Opening BINARY mode data connection.\r\n")
+      data = TCPSocket.new(host, port)
+      data_accepted.pop
+      data.print("x")
+      commands.push(sock.gets)
+      sock.close
+      data.close
+    }
+    begin
+      ftp = Net::FTP.new
+      ftp.connect(SERVER_ADDR, server.port)
+      ftp.login
+      transfer = Thread.start do
+        ftp.retrbinary("RETR foo", 16) do
+          transfer_reading.push(true)
+        end
+      end
+      data_accepted.push(true)
+      transfer_reading.pop
+      assert_raise(EOFError) { ftp.abort }
+      assert_equal(true, ftp.closed?)
+      assert_raise(Net::FTPConnectionError) { ftp.noop }
+      assert_raise(IOError, SystemCallError, EOFError) { transfer.join }
+    ensure
+      transfer.kill if transfer&.alive?
+      ftp.close if ftp
       server.close
     end
   end
