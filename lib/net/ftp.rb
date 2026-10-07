@@ -33,6 +33,407 @@ module Net
   class FTPPermError < FTPError; end
   class FTPProtoError < FTPError; end
   class FTPConnectionError < FTPError; end
+  # Raised when a command is issued while an asynchronous transfer
+  # (Net::FTPTransfer) is still using the session.
+  class FTPBusyError < FTPError; end
+
+  #
+  # Result of a cancellable transfer started by Net::FTP#start_retrbinary or
+  # Net::FTP#start_retrlines.
+  #
+  # +status+ is one of:
+  #
+  # +:complete+::          The transfer finished on its own and the final
+  #                        +2xx+ reply was consumed from the control
+  #                        connection.
+  # +:aborted+::           Cancellation was requested and the server
+  #                        accepted the ABOR after the transfer had already
+  #                        ended (a single +225+/+226+ reply).
+  # +:aborted_data_closed+:: Cancellation was requested while data was
+  #                        still flowing and the server reported the data
+  #                        connection as closed (+426+) and then
+  #                        acknowledged the ABOR (+225+/+226+).
+  # +:data_connection_failed+:: The data connection failed without a
+  #                        cancellation request; the server reported a
+  #                        +4xx+/+5xx+ failure (e.g. a single +426+).
+  # +:error+::             The transfer (or the control connection) failed
+  #                        for another reason; the session is never
+  #                        reusable.
+  #
+  # +reusable+ tells whether the control connection is still usable for
+  # further commands.  When it is +false+ the FTP session has been closed.
+  #
+  class FTPTransferResult
+    # The final transfer status as a Symbol (see above).
+    attr_reader :status
+
+    # +true+ when the control connection can still be used for commands.
+    attr_reader :reusable
+
+    # All control-connection replies consumed while finalizing the
+    # transfer, in the order they were received (e.g. ["426 ...",
+    # "226 ..."]).
+    attr_reader :responses
+
+    # The exception that caused a +:error+ or +:data_connection_failed+
+    # result, or +nil+.
+    attr_reader :error
+
+    def initialize(status, reusable, responses, error = nil) # :nodoc:
+      @status = status
+      @reusable = reusable
+      @responses = responses
+      @error = error
+      freeze
+    end
+
+    alias reusable? reusable
+
+    def complete?
+      @status == :complete
+    end
+
+    def aborted?
+      @status == :aborted || @status == :aborted_data_closed
+    end
+
+    def failed?
+      @status == :data_connection_failed || @status == :error
+    end
+
+    def inspect
+      "#<#{self.class} status=#{@status} reusable=#{@reusable}>"
+    end
+    alias to_s inspect
+  end
+
+  #
+  # A handle for an in-progress cancellable transfer returned by
+  # Net::FTP#start_retrbinary or Net::FTP#start_retrlines.
+  #
+  # Chunks are delivered with #each (or #read).  #cancel requests that the
+  # transfer be aborted with the FTP ABOR command, even if the worker is
+  # currently blocked reading the data connection.  #wait waits for the
+  # final FTPTransferResult.
+  #
+  # The control connection is only touched by the transfer's worker thread;
+  # FTP replies have no request identifier, so concurrent threads must not
+  # race to read the control socket.  Other commands are rejected while the
+  # transfer is active, and after #wait returns the session may be reused
+  # exactly when FTPTransferResult#reusable is true.
+  #
+  class FTPTransfer
+    include MonitorMixin
+
+    def initialize(ftp, command, mode, blocksize = nil, rest_offset = nil) # :nodoc:
+      super()
+      @ftp = ftp
+      @command = command
+      @mode = mode
+      @blocksize = blocksize
+      @rest_offset = rest_offset
+      @queue = Queue.new
+      @result = nil
+      @done = false
+      @cancel_requested = false
+      @ready_to_abor = false
+      @setup_succeeded = false
+      # :idle -> :starting -> :sent | :failed
+      @abor_state = :idle
+      @abor_cond = new_cond
+      @abor_error = nil
+      @wake_reader, @wake_writer = IO.pipe
+      @end_reason = nil
+      @finishing = false
+      @thread = Thread.start { run }
+    end
+
+    # Requests cancellation of the transfer.  Safe to call from any
+    # thread, including the one iterating with #each, and safe to call
+    # more than once or after the transfer has already finished.
+    #
+    # Returns immediately; use #wait to obtain the FTPTransferResult.
+    def cancel
+      synchronize { @cancel_requested = true }
+      begin
+        @wake_writer.write_nonblock("!", exception: false)
+      rescue IOError
+      end
+      begin_abor if synchronize { @ready_to_abor && !@finishing }
+      nil
+    end
+
+    # Returns +true+ after #cancel has been called.
+    def cancel_requested?
+      synchronize { @cancel_requested }
+    end
+
+    # Returns +true+ once the final result has been published.
+    def done?
+      synchronize { @done }
+    end
+
+    # Yields each transferred chunk (String) and returns the final
+    # FTPTransferResult.  Raises only for programmer errors; transfer or
+    # network failures are reported through the result.  Data arriving
+    # after a #cancel request is dropped.
+    def each
+      loop do
+        item = @queue.pop
+        break if item.equal?(END_SENTINEL)
+        yield(item)
+      end
+      @queue.pop
+    end
+
+    # Waits until the transfer finishes and returns its
+    # FTPTransferResult, draining any not-yet-consumed chunks.
+    def wait
+      result = nil
+      until result
+        item = @queue.pop
+        result = item if item.is_a?(FTPTransferResult)
+      end
+      result
+    end
+
+    # Joins the worker thread (mainly for tests/cleanup).
+    def join
+      @thread.join
+      self
+    end
+
+    # :nodoc:
+    def worker_thread?(thread)
+      @thread.equal?(thread)
+    end
+
+    # :nodoc: Called by the worker once the transfer command has been
+    # issued (so an early cancel cannot pipeline ABOR ahead of RETR).
+    def worker_ready!
+      synchronize do
+        @ready_to_abor = true
+      end
+      begin_abor if synchronize { @cancel_requested && !@finishing }
+    end
+
+    # :nodoc: Ensures any requested ABOR has been sent (possibly by this
+    # caller) before the worker reads the next control reply.
+    def settle_abor
+      do_send = synchronize do
+        next false unless @cancel_requested
+        if @finishing || @abor_state != :idle
+          @abor_cond.wait until @abor_state != :starting || @finishing
+          next false
+        end
+        @abor_state = :starting
+        next true
+      end
+      send_abor_now if do_send
+      synchronize { @abor_state == :sent || @abor_state == :failed }
+    end
+
+    # :nodoc:
+    def abort_sent?
+      synchronize { @abor_state == :sent }
+    end
+
+    # :nodoc:
+    def end_reason
+      synchronize { @end_reason }
+    end
+
+    # :nodoc:
+    def abort_error
+      synchronize { @abor_error }
+    end
+
+    private
+
+    END_SENTINEL = :__ftp_transfer_end__
+    private_constant :END_SENTINEL
+
+    def cancelled?
+      synchronize { @cancel_requested }
+    end
+
+    # Exactly one thread performs the ABOR write; every other caller
+    # waits on the condition variable instead of busy-spinning.
+    def begin_abor
+      sender = synchronize do
+        if @finishing || @abor_state != :idle
+          @abor_cond.wait until @abor_state != :starting || @finishing
+          next false
+        end
+        @abor_state = :starting
+        next true
+      end
+      send_abor_now if sender
+    end
+
+    # Performs the single ABOR write; the caller has claimed the send.
+    def send_abor_now
+      begin
+        @ftp.send_abor_command
+        finish_abor(nil)
+      rescue Exception => error
+        # The ABOR write failed (e.g. a broken TLS control stream): the
+        # session cannot be recovered.  Tearing it down also unblocks a
+        # worker stuck reading the data connection.
+        finish_abor(error)
+        @ftp.teardown_session!
+      end
+    end
+
+    def finish_abor(error)
+      synchronize do
+        @abor_error = error
+        @abor_state = error ? :failed : :sent
+        @abor_cond.broadcast
+      end
+    end
+
+    # Worker enters the reply-drain/finalization phase: from here on the
+    # worker owns all control reads/writes, so a cancel arriving after
+    # this point must not start a second, untracked ABOR.
+    def mark_finishing
+      synchronize do
+        @finishing = true
+        @abor_cond.broadcast
+      end
+    end
+
+    def run
+      conn = nil
+      responses = []
+      result = nil
+      begin
+        @ftp.activate_transfer(self)
+        @ftp.execute_transfer(self, @mode) do
+          conn = @ftp.setup_transfer(@command, @rest_offset)
+          synchronize { @setup_succeeded = true }
+          pump_error = nil
+          begin
+            pump(conn)
+          rescue Exception => error
+            pump_error = error
+          end
+          mark_finishing
+          result = @ftp.finalize_transfer(self, conn, responses,
+                                          pump_error)
+        end
+      rescue Exception => error
+        mark_finishing
+        setup_ok = synchronize { @setup_succeeded }
+        fatal = !setup_ok && !recoverable_setup_failure?(error)
+        result = build_error_result(error, responses, fatal)
+      ensure
+        begin
+          conn&.close
+        rescue IOError
+        end
+        @ftp.deactivate_transfer(self)
+        publish(result ||
+                FTPTransferResult.new(:error, false, responses.freeze))
+        begin
+          @wake_reader.close
+          @wake_writer.close
+        rescue IOError
+        end
+      end
+    end
+
+    # A setup failure reported through a normal control reply (4xx/5xx)
+    # leaves the control connection usable.
+    def recoverable_setup_failure?(error)
+      error.is_a?(FTPReplyError) || error.is_a?(FTPTempError) ||
+        error.is_a?(FTPPermError) || error.is_a?(FTPProtoError)
+    end
+
+    def pump(conn)
+      if @mode == :binary
+        pump_binary(conn)
+      else
+        pump_lines(conn)
+      end
+    end
+
+    def pump_binary(conn)
+      until cancelled?
+        data = read_chunk(conn) { conn.read(@blocksize) }
+        break if data.nil?
+        enqueue(data)
+      end
+    end
+
+    def pump_lines(conn)
+      until cancelled?
+        line = read_chunk(conn) { conn.gets }
+        break if line.nil?
+        enqueue(line.sub(/\r?\n\z/, ""))
+      end
+    end
+
+    # Reads one chunk, unblocking promptly when #cancel fires by waiting
+    # on both the data socket and the cancellation wake pipe.  A natural
+    # EOF records :eof; a cancellation wake records :cancelled without
+    # issuing another read.
+    def read_chunk(conn)
+      io = conn.to_io
+      loop do
+        ready, = IO.select([io, @wake_reader], nil, nil,
+                           @ftp.read_timeout)
+        if ready.nil?
+          raise Net::ReadTimeout, "timed out while reading data"
+        end
+        if ready.include?(@wake_reader)
+          if cancelled?
+            settle_abor
+            synchronize { @end_reason ||= :cancelled }
+            return nil
+          end
+          # Drain the wake byte so level-triggered select does not spin.
+          begin
+            @wake_reader.read_nonblock(1024) rescue nil
+          rescue IOError
+          end
+        end
+        chunk = yield
+        synchronize { @end_reason ||= :eof } if chunk.nil?
+        return chunk
+      end
+    end
+
+    def enqueue(chunk)
+      return if cancelled?
+      @queue.push(chunk)
+    end
+
+    def publish(result)
+      synchronize do
+        return if @done
+        @done = true
+        @result = result
+        @abor_cond.broadcast
+      end
+      @queue.push(END_SENTINEL)
+      @queue.push(result)
+    end
+
+    def build_error_result(error, responses, fatal)
+      status = if error.is_a?(FTPTempError) || error.is_a?(FTPPermError) ||
+                  error.is_a?(FTPReplyError) || error.is_a?(FTPProtoError)
+                 :data_connection_failed
+               else
+                 :error
+               end
+      @ftp.teardown_session! if fatal
+      FTPTransferResult.new(status, !fatal, responses.freeze, error)
+    end
+
+    # The worker thread; used by Net::FTP to guard the control connection.
+    attr_reader :thread
+  end
   # :startdoc:
 
   #
@@ -71,6 +472,8 @@ module Net
   # - #gettextfile
   # - #putbinaryfile
   # - #puttextfile
+  # - #start_retrbinary (cancellable, non-blocking download)
+  # - #start_retrlines (cancellable, non-blocking listing)
   # - #chdir
   # - #nlst
   # - #size
@@ -297,6 +700,7 @@ module Net
       @resume = false
       @bare_sock = @sock = NullSocket.new
       @logged_in = false
+      @active_transfer = nil
       @open_timeout = options[:open_timeout]
       @ssl_handshake_timeout = options[:ssl_handshake_timeout]
       @read_timeout = options[:read_timeout] || 60
@@ -522,6 +926,7 @@ module Net
     #
     def sendcmd(cmd)
       synchronize do
+        check_transfer_busy
         putline(cmd)
         return getresp
       end
@@ -532,10 +937,24 @@ module Net
     #
     def voidcmd(cmd)
       synchronize do
+        check_transfer_busy
         putline(cmd)
         voidresp
       end
     end
+
+    # While a cancellable transfer is active, only its own worker thread
+    # may touch the control connection: FTP replies carry no command id,
+    # so a second reader could steal (or leave behind) another command's
+    # replies.
+    def check_transfer_busy # :nodoc:
+      transfer = @active_transfer
+      if transfer && !transfer.worker_thread?(Thread.current)
+        raise FTPBusyError,
+          "cannot send commands while a cancellable transfer is active"
+      end
+    end
+    private :check_transfer_busy
 
     # Constructs and send the appropriate PORT (or EPRT) command
     def sendport(host, port) # :nodoc:
@@ -623,6 +1042,306 @@ module Net
       end
     end
     private :transfercmd
+
+    # :call-seq:
+    #   ftp.start_retrbinary(cmd, blocksize, rest_offset = nil) -> transfer
+    #
+    # Starts a binary download using +cmd+ (such as "RETR foo") without
+    # blocking and returns a Net::FTPTransfer handle.  Use
+    # Net::FTPTransfer#each to receive chunks, Net::FTPTransfer#cancel to
+    # abort the transfer (even while a data read is blocked), and
+    # Net::FTPTransfer#wait for the Net::FTPTransferResult.
+    #
+    # The result says whether the control connection is reusable.  Other
+    # FTP commands must not be issued before #wait returns.
+    #
+    def start_retrbinary(cmd, blocksize, rest_offset = nil)
+      FTPTransfer.new(self, cmd, :binary, blocksize, rest_offset)
+    end
+
+    # :call-seq:
+    #   ftp.start_retrlines(cmd) -> transfer
+    #
+    # Starts a text download (see #retrlines) without blocking and
+    # returns a Net::FTPTransfer handle.  See #start_retrbinary for the
+    # cancellation semantics.
+    #
+    def start_retrlines(cmd)
+      FTPTransfer.new(self, cmd, :line)
+    end
+
+    # Registers the transfer whose worker thread owns the session.
+    def activate_transfer(transfer) # :nodoc:
+      synchronize do
+        if @active_transfer
+          raise FTPBusyError, "another transfer is already active"
+        end
+        @active_transfer = transfer
+      end
+    end
+
+    def deactivate_transfer(transfer) # :nodoc:
+      synchronize do
+        @active_transfer = nil if @active_transfer.equal?(transfer)
+      end
+    end
+
+    # Runs the worker's transfer body under with_binary; called by the
+    # worker thread only.
+    def execute_transfer(transfer, mode)
+      with_binary(mode == :binary) do
+        yield
+      end
+    end
+
+    # Opens the data connection and sends the transfer command.  Called by
+    # the worker thread only.
+    def setup_transfer(cmd, rest_offset = nil)
+      conn = transfercmd(cmd, rest_offset)
+      @active_transfer.worker_ready!
+      return conn
+    end
+
+    # Sends ABOR without reading anything.  Plain FTP uses Telnet
+    # out-of-band data as the classic client does; under FTPS the OOB
+    # byte would corrupt the TLS record stream, so the command is written
+    # normally in-band.  The worker thread remains the only reader, and
+    # it will drain the ABOR replies itself.
+    def send_abor_command # :nodoc:
+      line = "ABOR" + CRLF
+      synchronize do
+        if @ssl_context
+          putline("ABOR")
+        else
+          debug_print "put: ABOR"
+          @sock.send(line, Socket::MSG_OOB)
+        end
+      end
+    end
+
+    # Forcibly closes the session when it cannot be made consistent again
+    # (ABOR could not be sent over TLS, replies desynchronised, etc.).
+    # No QUIT is attempted and the object is marked unusable.
+    def teardown_session! # :nodoc:
+      synchronize do
+        begin
+          @sock&.close
+        rescue IOError, SystemCallError
+        end
+        true
+      end
+    end
+
+    # Seconds to wait for a delayed second ABOR reply after the transfer
+    # reply has already ended the transfer (single-reply servers).
+    ABOR_TRAILING_GRACE = 1
+
+    # Drains every control reply belonging to the transfer and to any
+    # ABOR, classifies the outcome and builds the final
+    # Net::FTPTransferResult.  Called by the worker thread only; this is
+    # the single place that reads the control socket while a transfer is
+    # in progress, so neither a successful 226 nor a 426 is ever left for
+    # a later NOOP/PWD to consume.
+    def finalize_transfer(transfer, conn, responses, pump_error) # :nodoc:
+      if transfer.end_reason == :eof && pump_error.nil?
+        begin
+          conn.shutdown(Socket::SHUT_WR) rescue nil
+          conn.read_timeout = 1
+          conn.read rescue nil
+        rescue SystemCallError, IOError
+        end
+      end
+
+      fatal = !transfer.abort_error.nil?
+      fatal_error = transfer.abort_error
+      data_pending = true
+      abor_pending = false
+      saw_426 = false
+      saw_225 = false
+      saw_data_reply = false
+      abor_acknowledged = false
+      data_failure = !pump_error.nil?
+      data_failure_error = pump_error
+
+      while data_pending || abor_pending
+        # Resolve any racing cancellation before reading, so the next
+        # reply can always be attributed to a known command.
+        canceled = transfer.settle_abor
+        # The server owes a definite reply while the transfer cycle is
+        # open, or right after a 426 (the ABOR acknowledgement): wait the
+        # full read timeout.  The bounded grace applies only to an
+        # optional trailing acknowledgement after a 226 completion.
+        grace = !data_pending && !saw_426
+        resp = begin
+          read_transfer_reply(grace ? ABOR_TRAILING_GRACE : nil)
+        rescue Net::ReadTimeout
+          if grace
+            # No optional trailing ABOR acknowledgement: the transfer
+            # reply already consumed also covered the ABOR.
+            abor_pending = false
+            break
+          end
+          # A required reply never arrived (after 426, or the transfer
+          # reply itself): the control connection is desynchronised and
+          # cannot safely be reused.
+          fatal = true
+          fatal_error ||= $!
+          break
+        rescue FTPError, EOFError, SystemCallError,
+                 OpenSSL::SSL::SSLError
+          fatal = true
+          fatal_error ||= $!
+          break
+        end
+
+        responses << resp
+        code = resp[0, 3]
+        was_abor_pending = abor_pending
+        case code
+        when "226"
+          # Transfer complete.  Closes the transfer cycle; on
+          # single-reply servers this same 226 also answers the ABOR.
+          data_pending = false
+          saw_data_reply = true
+          if was_abor_pending
+            abor_pending = false
+            abor_acknowledged = true
+          end
+        when "225"
+          # Acknowledges the ABOR.  RFC 959 order is 426/226 then 225,
+          # but some servers deliver 225 first while the transfer cycle
+          # is still open: keep waiting for the transfer reply in that
+          # case rather than accepting 225 as the transfer reply.
+          saw_225 = true
+          abor_pending = false
+          abor_acknowledged = true
+          # Single-reply servers answer an ABOR with only "225 no
+          # transfer"; treat it as closing the data cycle as well.
+          data_pending = false if canceled
+        when "426"
+          # Connection closed; transfer aborted.  With an outstanding
+          # ABOR a definite acknowledgement must follow (full timeout);
+          # without an ABOR this is a data-connection failure by itself.
+          saw_426 = true
+          saw_data_reply = true
+          data_pending = false
+          if canceled
+            # The following 225/226 acknowledges the ABOR; mark it
+            # required even if settle_abor observed the send only now.
+            abor_pending = true
+          else
+            data_failure = true
+            data_failure_error ||= FTPTempError.new(resp)
+          end
+        when /\A[45]/
+          if !was_abor_pending
+            data_pending = false
+            data_failure = true
+            data_failure_error ||= FTPTempError.new(resp)
+          else
+            fatal = true
+            fatal_error ||= FTPProtoError.new(resp)
+            abor_pending = false
+          end
+        else
+          fatal = true
+          fatal_error ||= FTPProtoError.new(resp)
+        end
+        # An outstanding ABOR always gets its own acknowledgement.  This
+        # is recomputed from the cancel state, so an ABOR that lands just
+        # before the current reply is accounted for even if it had not
+        # been observed as "in flight" at the top of the iteration.
+        if canceled && data_pending && !saw_426
+          abor_pending = true
+        end
+        # A 226 that arrived before the ABOR was sent leaves the ABOR
+        # acknowledgement outstanding.
+        if canceled && !data_pending && !abor_pending &&
+           !abor_acknowledged && !saw_225
+          abor_pending = true
+        end
+      end
+
+      # Last race: a canceler may be poised to send ABOR only after the
+      # loop exited.  Settle it (sending here ourselves if necessary),
+      # then drain an acknowledgement only when the transfer cycle ended
+      # with a 2xx and no 426 was involved; after a 426 the acknowledge-
+      # ment was already a required reply consumed above.  deactivate_
+      # transfer runs only after this, so no reply can leak into PWD.
+      trailing_needed = transfer.settle_abor && !saw_225 &&
+                        !abor_acknowledged && !saw_426
+      if trailing_needed
+        begin
+          resp = read_transfer_reply(ABOR_TRAILING_GRACE)
+          responses << resp
+          saw_225 = true if resp.start_with?("225")
+          if resp.start_with?(/[45]/)
+            data_failure = true
+            data_failure_error ||= FTPTempError.new(resp)
+          end
+        rescue Net::ReadTimeout, FTPError, EOFError, SystemCallError,
+               OpenSSL::SSL::SSLError
+          # Server gave nothing more; the previous transfer reply covered
+          # the ABOR.  A control-channel error here is fatal.
+          unless $!.is_a?(Net::ReadTimeout)
+            fatal = true
+            fatal_error ||= $!
+          end
+        end
+      end
+
+      canceled = transfer.abort_sent?
+      status, reusable = classify_transfer(
+        end_reason: transfer.end_reason,
+        canceled: canceled,
+        saw_426: saw_426,
+        saw_data_reply: saw_data_reply,
+        data_failure: data_failure,
+        fatal: fatal
+      )
+      teardown_session! if fatal
+      error = fatal ? fatal_error : (data_failure ? data_failure_error : nil)
+      FTPTransferResult.new(status, reusable, responses.freeze, error)
+    end
+
+    # Reads one complete control reply, waiting at most +grace+ seconds.
+    # Unlike getresp, this never raises for 4xx/5xx codes: the caller
+    # classifies them.
+    def read_transfer_reply(grace = nil)
+      synchronize do
+        if grace
+          old_timeout = @sock.read_timeout
+          @sock.read_timeout = grace
+          begin
+            return getmultiline
+          ensure
+            @sock.read_timeout = old_timeout
+          end
+        end
+        getmultiline
+      end
+    end
+    private :read_transfer_reply
+
+    def classify_transfer(end_reason:, canceled:, saw_426:,
+                          saw_data_reply:, data_failure:, fatal:)
+      if fatal
+        return :error, false
+      end
+      # A natural EOF acknowledged by 226 is a completed transfer even if
+      # an ABOR raced in right at the end: the data all arrived.
+      if end_reason == :eof && saw_data_reply && !saw_426 && !data_failure
+        return :complete, true
+      end
+      if !canceled && (data_failure || !saw_data_reply)
+        return :data_connection_failed, true
+      end
+      if canceled
+        return saw_426 ? :aborted_data_closed : :aborted, true
+      end
+      return :complete, true
+    end
+    private :classify_transfer
 
     #
     # Logs in to the remote host.  The session must have been
@@ -1507,7 +2226,8 @@ module Net
     end
 
     class BufferedSocket < BufferedIO
-      [:local_address, :remote_address, :addr, :peeraddr, :send, :shutdown].each do |method|
+      [:local_address, :remote_address, :addr, :peeraddr, :send,
+       :shutdown, :to_io].each do |method|
         define_method(method) { |*args|
           @io.__send__(method, *args)
         }

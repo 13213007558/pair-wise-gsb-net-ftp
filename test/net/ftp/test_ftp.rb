@@ -2185,6 +2185,89 @@ EOF
       end
     end
 
+    # FTPS: the ABOR must be written in-band (Telnet OOB cannot be used
+    # over a TLS record stream), and the session must stay usable after
+    # the 426/226 pair is fully drained.
+    def test_passive_private_data_connection_cancellable
+      return unless defined?(OpenSSL)
+      server = TCPServer.new(SERVER_ADDR, 0)
+      port = server.addr[1]
+      commands = Queue.new
+      @thread = Thread.start do
+        raw = server.accept
+        begin
+          raw.print("220 (test).\r\n")
+          commands.push(raw.gets)
+          raw.print("234 AUTH success.\r\n")
+          ctx = OpenSSL::SSL::SSLContext.new
+          ctx.ca_file = CA_FILE
+          ctx.key = File.open(SERVER_KEY) { |f| OpenSSL::PKey::RSA.new(f) }
+          ctx.cert = File.open(SERVER_CERT) { |f|
+            OpenSSL::X509::Certificate.new(f)
+          }
+          sock = OpenSSL::SSL::SSLSocket.new(raw, ctx)
+          sock.sync_close = true
+          sock.accept
+          commands.push(sock.gets); sock.print("200 PBSZ ok\r\n")
+          commands.push(sock.gets); sock.print("200 PROT ok\r\n")
+          commands.push(sock.gets); sock.print("331 ok\r\n")
+          commands.push(sock.gets); sock.print("230 ok\r\n")
+          commands.push(sock.gets); sock.print("200 type ok\r\n")
+          data_server = create_data_connection_server(sock)
+          commands.push(sock.gets) # PASV/EPSV
+          commands.push(sock.gets) # RETR
+          sock.print("150 opening\r\n")
+          dconn = OpenSSL::SSL::SSLSocket.new(data_server.accept, ctx)
+          dconn.sync_close = true
+          dconn.accept
+          dconn.print("AAAA")
+          dconn.flush
+          commands.push(sock.gets) # ABOR (in-band TLS)
+          sock.print("426 closed\r\n")
+          sock.print("226 abort ok\r\n")
+          dconn.close
+          data_server.close
+          commands.push(sock.gets) # PWD
+          sock.print(%q{257 "/"\r\n})
+        ensure
+          sock&.close rescue nil
+          server.close rescue nil
+        end
+      end
+      ftp = Net::FTP.new(SERVER_NAME, port: port,
+                         ssl: { ca_file: CA_FILE }, passive: true)
+      ftp.read_timeout *= 5 if mjit_enabled?
+      begin
+        assert_equal("AUTH TLS\r\n", commands.shift)
+        assert_equal("PBSZ 0\r\n", commands.shift)
+        assert_equal("PROT P\r\n", commands.shift)
+        ftp.login
+        assert_match(/\AUSER /, commands.shift)
+        assert_match(/\APASS /, commands.shift)
+        assert_equal("TYPE I\r\n", commands.shift)
+        transfer = ftp.start_retrbinary("RETR foo", 4)
+        got = +""
+        consumer = Thread.start { transfer.each { |c| got << c } }
+        sleep(0.3)
+        transfer.cancel
+        result = transfer.wait
+        consumer.join
+        assert_equal(:aborted_data_closed, result.status)
+        assert_equal(true, result.reusable?)
+        assert_equal("AAAA", got)
+        assert_match(/\A(PASV|EPSV)\r\n/, commands.shift)
+        assert_equal("RETR foo\r\n", commands.shift)
+        assert_equal("ABOR\r\n", commands.shift)
+        # PWD must receive its own 257 reply.
+        assert_equal("/", ftp.pwd)
+        assert_equal("PWD\r\n", commands.shift)
+      ensure
+        ftp.close if ftp && !ftp.closed?
+      end
+    rescue RuntimeError, LoadError
+      # openssl unavailable
+    end
+
     def test_tls_connect_timeout
       server = TCPServer.new(SERVER_ADDR, 0)
       port = server.addr[1]
@@ -2265,6 +2348,313 @@ EOF
         ftp.close if ftp
       end
     ensure
+      server.close
+    end
+  end
+
+  #
+  # Runs one scripted cancellable-transfer scenario in active mode.
+  #
+  # +scenario+ controls the control-connection script:
+  #
+  # :normal::    sends all data, closes data conn, sends 226; no cancel
+  # :double::    after ABOR, sends 426 then 226
+  # :delayed::   after ABOR, sends 426, waits, then sends 226
+  # :single::    after ABOR, sends only 225
+  # :complete::  finishes the transfer (226) racing with ABOR, then 225
+  # :datafail::  closes the data conn and sends a single 426, no cancel
+  # :notfound::  replies 550 to RETR
+  #
+  def cancellable_transfer_scenario(scenario, delay: 1.0)
+    commands = Queue.new
+    server = create_ftp_server { |sock|
+      sock.print("220 (test).\r\n")
+      commands.push(sock.gets)
+      sock.print("331 Please specify the password.\r\n")
+      commands.push(sock.gets)
+      sock.print("230 Login successful.\r\n")
+      commands.push(sock.gets)
+      sock.print("200 Switching to Binary mode.\r\n")
+      if scenario == :notfound
+        port = sock.gets
+        host, portnum = process_port_or_eprt(sock, port)
+        commands.push(port)
+        commands.push(sock.gets) # RETR
+        sock.print("550 Failed to open file.\r\n")
+        commands.push(sock.gets) # PWD
+        sock.print(%q{257 "/" is current directory.\r\n})
+      end
+      port = sock.gets
+      host, portnum = process_port_or_eprt(sock, port)
+      commands.push(port)
+      commands.push(sock.gets) # RETR
+      sock.print("150 Opening BINARY mode data connection.\r\n")
+      conn = TCPSocket.new(host, portnum)
+      conn.print("AAAA")
+      conn.flush
+      control_commands = Queue.new
+      reader = Thread.start do
+        loop { control_commands.push(sock.gets) }
+      rescue StandardError
+      end
+      case scenario
+      when :normal
+        sleep(0.3)
+        conn.print("BBBB")
+        conn.close
+        sock.print("226 Transfer complete.\r\n")
+      when :double
+        control_commands.pop # ABOR
+        sock.print("426 Connection closed; transfer aborted.\r\n")
+        sock.print("226 Aborted successfully.\r\n")
+        conn.close
+      when :delayed
+        control_commands.pop # ABOR
+        sock.print("426 Connection closed; transfer aborted.\r\n")
+        sleep(delay)
+        sock.print("226 Aborted successfully.\r\n")
+        conn.close
+      when :single
+        control_commands.pop # ABOR
+        sock.print("225 No transfer to ABOR.\r\n")
+        conn.close
+      when :complete
+        sleep(0.3)
+        conn.print("BBBB") rescue nil
+        conn.close
+        sock.print("226 Transfer complete.\r\n")
+        abor = control_commands.pop
+        sock.print("225 No transfer to ABOR.\r\n") if abor
+      when :datafail
+        sleep(0.3)
+        conn.close
+        sock.print("426 Connection closed; transfer aborted.\r\n")
+      end
+      commands.push(sock.gets) # PWD
+      sock.print(%q{257 "/" is current directory.\r\n})
+      reader.kill
+    }
+    [server, commands]
+  end
+
+  def with_cancellable_transfer(scenario, **opts)
+    server, = cancellable_transfer_scenario(scenario, **opts)
+    ftp = Net::FTP.new
+    ftp.read_timeout = 5
+    ftp.connect(SERVER_ADDR, server.port)
+    ftp.login
+    begin
+      transfer = ftp.start_retrbinary("RETR foo", 4)
+      got = +""
+      consumer = Thread.start do
+        transfer.each { |chunk| got << chunk }
+      end
+      result = yield(ftp, transfer, got, consumer)
+      [ftp, got, result]
+    ensure
+      ftp.close if ftp && !ftp.closed?
+      server.close
+    end
+  end
+
+  def test_start_retrbinary_completes_naturally
+    ftp, got, result = with_cancellable_transfer(:normal) do |f, t, _, c|
+      r = t.wait
+      c.join
+      [r, f.pwd]
+    end
+    assert_equal(:complete, result[0].status)
+    assert_equal(true, result[0].reusable?)
+    assert_equal("AAAABBBB", got)
+    assert_equal(["226 Transfer complete.\n"], result[0].responses)
+    assert_equal("/", result[1])
+  end
+
+  def test_start_retrbinary_abort_double_reply
+    ftp, got, result = with_cancellable_transfer(:double) do |f, t, _, c|
+      sleep(0.2)
+      t.cancel
+      r = t.wait
+      c.join
+      [r, f.pwd]
+    end
+    assert_equal(:aborted_data_closed, result[0].status)
+    assert_equal(true, result[0].reusable?)
+    assert_equal(["426 Connection closed; transfer aborted.\n",
+                  "226 Aborted successfully.\n"],
+                 result[0].responses)
+    # PWD must get its own 257, not the leftover 226 or 426.
+    assert_equal("/", result[1])
+  end
+
+  def test_start_retrbinary_abort_delayed_second_reply
+    ftp, got, result = with_cancellable_transfer(:delayed, delay: 1.5) do |f, t, _, c|
+      sleep(0.2)
+      t.cancel
+      r = t.wait
+      c.join
+      [r, f.pwd]
+    end
+    assert_equal(:aborted_data_closed, result[0].status)
+    assert_equal(true, result[0].reusable?)
+    assert_equal("426", result[0].responses[0][0, 3])
+    assert_equal("226", result[0].responses[1][0, 3])
+    assert_equal("/", result[1])
+  end
+
+  def test_start_retrbinary_abort_single_reply
+    ftp, got, result = with_cancellable_transfer(:single) do |f, t, _, c|
+      sleep(0.2)
+      t.cancel
+      r = t.wait
+      c.join
+      [r, f.pwd]
+    end
+    assert_equal(:aborted, result[0].status)
+    assert_equal(true, result[0].reusable?)
+    assert_equal(["225 No transfer to ABOR.\n"], result[0].responses)
+    assert_equal("/", result[1])
+  end
+
+  def test_start_retrbinary_cancel_races_with_completion
+    ftp, got, result = with_cancellable_transfer(:complete) do |f, t, _, c|
+      sleep(0.2)
+      t.cancel
+      r = t.wait
+      c.join
+      [r, f.pwd]
+    end
+    # Exactly one final result is published.  The cancel raced with the
+    # natural end: all data had arrived, but an ABOR was sent and
+    # acknowledged, so the outcome is reported as an accepted abort
+    # rather than fabricated as a plain completion.  Either way both
+    # replies are drained and the session is reusable.
+    assert_equal(:aborted, result[0].status)
+    assert_equal(true, result[0].reusable?)
+    assert_equal("AAAABBBB", got)
+    assert_equal("226", result[0].responses[0][0, 3])
+    assert_equal("225", result[0].responses[1][0, 3])
+    assert_equal("/", result[1])
+  end
+
+  def test_start_retrbinary_data_connection_failure
+    ftp, got, result = with_cancellable_transfer(:datafail) do |f, t, _, c|
+      r = t.wait
+      c.join
+      [r, f.pwd]
+    end
+    assert_equal(:data_connection_failed, result[0].status)
+    assert_equal(true, result[0].reusable?)
+    assert_equal(["426 Connection closed; transfer aborted.\n"],
+                 result[0].responses)
+    assert_kind_of(Net::FTPTempError, result[0].error)
+    assert_equal("/", result[1])
+  end
+
+  def test_start_retrbinary_setup_failure_is_reusable
+    server, = cancellable_transfer_scenario(:notfound)
+    ftp = Net::FTP.new
+    ftp.read_timeout = 5
+    ftp.connect(SERVER_ADDR, server.port)
+    ftp.login
+    begin
+      transfer = ftp.start_retrbinary("RETR missing", 4)
+      result = transfer.wait
+      assert_equal(:data_connection_failed, result.status)
+      assert_equal(true, result.reusable?)
+      assert_kind_of(Net::FTPPermError, result.error)
+      # The 550 was fully consumed; PWD gets its own fresh reply.
+      assert_equal("/", ftp.pwd)
+    ensure
+      ftp.close if ftp && !ftp.closed?
+      server.close
+    end
+  end
+
+  def test_start_retrlines_abort_double_reply
+    commands = []
+    server = create_ftp_server { |sock|
+      sock.print("220 (test).\r\n")
+      commands.push(sock.gets)
+      sock.print("331 ok\r\n")
+      commands.push(sock.gets)
+      sock.print("230 ok\r\n")
+      commands.push(sock.gets)
+      sock.print("200 binary ok\r\n")
+      commands.push(sock.gets) # TYPE A
+      sock.print("200 ascii ok\r\n")
+      port = sock.gets
+      host, portnum = process_port_or_eprt(sock, port)
+      commands.push(port)
+      commands.push(sock.gets) # LIST
+      sock.print("150 listing\r\n")
+      conn = TCPSocket.new(host, portnum)
+      conn.print("foo\r\nbar\r\n")
+      conn.flush
+      commands.push(sock.gets) # ABOR
+      sock.print("426 closed\r\n")
+      sock.print("226 aborted\r\n")
+      conn.close
+      commands.push(sock.gets) # PWD
+      sock.print(%q{257 "/"\r\n})
+    }
+    begin
+      ftp = Net::FTP.new
+      ftp.read_timeout = 5
+      ftp.connect(SERVER_ADDR, server.port)
+      ftp.login
+      transfer = ftp.start_retrlines("LIST")
+      lines = []
+      consumer = Thread.start { transfer.each { |line| lines << line } }
+      sleep(0.2)
+      transfer.cancel
+      result = transfer.wait
+      consumer.join
+      assert_equal(:aborted_data_closed, result.status)
+      assert_equal(true, result.reusable?)
+      assert_equal(["foo", "bar"], lines)
+      assert_equal("/", ftp.pwd)
+    ensure
+      ftp.close if ftp && !ftp.closed?
+      server.close
+    end
+  end
+
+  def test_start_retrbinary_busy_guard
+    commands = Queue.new
+    server = create_ftp_server { |sock|
+      sock.print("220 (test).\r\n")
+      sock.gets; sock.print("331 ok\r\n")
+      sock.gets; sock.print("230 ok\r\n")
+      sock.gets; sock.print("200 type ok\r\n")
+      port = sock.gets
+      host, portnum = process_port_or_eprt(sock, port)
+      sock.gets # RETR
+      sock.print("150 opening\r\n")
+      conn = TCPSocket.new(host, portnum)
+      conn.print("AAAA")
+      conn.flush
+      abor = sock.gets
+      sock.print("426 closed\r\n")
+      sock.print("226 abort ok\r\n")
+      conn.close
+      sock.gets # PWD
+      sock.print(%q{257 "/"\r\n})
+    }
+    ftp = Net::FTP.new
+    ftp.read_timeout = 5
+    ftp.connect(SERVER_ADDR, server.port)
+    ftp.login
+    begin
+      transfer = ftp.start_retrbinary("RETR foo", 4)
+      sleep(0.2)
+      assert_raise(Net::FTPBusyError) { ftp.pwd }
+      transfer.cancel
+      result = transfer.wait
+      assert_equal(:aborted_data_closed, result.status)
+      assert_equal("/", ftp.pwd)
+    ensure
+      ftp.close if ftp && !ftp.closed?
       server.close
     end
   end
