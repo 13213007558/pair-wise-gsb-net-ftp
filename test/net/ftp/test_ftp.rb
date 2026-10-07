@@ -1265,6 +1265,203 @@ EOF
     end
   end
 
+  def test_retrbinary_cancellable_abort_single_reply
+    commands = []
+    server = create_retr_server(commands) { |sock, conn|
+      commands.push(stream_until_abor(sock, conn))
+      sock.print("226 Abort successful.\r\n")
+      commands.push(sock.gets)
+      sock.print("257 \"/\" is the current directory.\r\n")
+    }
+    begin
+      ftp = connect_cancellable_ftp(server, commands)
+      begin
+        handle = ftp.retrbinary_cancellable("RETR bigfile")
+        result, cancel_result, received = perform_with_cancel(handle)
+        assert_same(result, cancel_result)
+        assert_equal(:aborted, result.state)
+        assert_equal(true, result.aborted?)
+        assert_equal(false, result.completed?)
+        assert_equal(true, result.control_usable?)
+        assert_equal(1, result.replies.size)
+        assert_match(/\A226 /, result.replies[0])
+        assert(received.size > 0)
+        assert_equal("/", ftp.pwd)
+        assert_match(/\A(PORT|EPRT) /, commands.shift)
+        assert_equal("RETR bigfile\r\n", commands.shift)
+        assert_equal("ABOR\r\n", commands.shift)
+        assert_equal("PWD\r\n", commands.shift)
+        assert_equal(nil, commands.shift)
+      ensure
+        ftp.close
+      end
+    ensure
+      server.close
+    end
+  end
+
+  def test_retrbinary_cancellable_abort_double_reply
+    commands = []
+    server = create_retr_server(commands) { |sock, conn|
+      commands.push(stream_until_abor(sock, conn))
+      sock.print("426 Transfer aborted.\r\n")
+      sock.print("226 Abort successful.\r\n")
+      commands.push(sock.gets)
+      sock.print("257 \"/\" is the current directory.\r\n")
+    }
+    begin
+      ftp = connect_cancellable_ftp(server, commands)
+      begin
+        handle = ftp.retrbinary_cancellable("RETR bigfile")
+        result, cancel_result, received = perform_with_cancel(handle)
+        assert_same(result, cancel_result)
+        assert_equal(:interrupted, result.state)
+        assert_equal(true, result.aborted?)
+        assert_equal(true, result.control_usable?)
+        assert_equal(2, result.replies.size)
+        assert_match(/\A426 /, result.replies[0])
+        assert_match(/\A226 /, result.replies[1])
+        assert(received.size > 0)
+        # both replies of the 426/226 sequence were consumed, so PWD
+        # receives its own reply
+        assert_equal("/", ftp.pwd)
+        assert_match(/\A(PORT|EPRT) /, commands.shift)
+        assert_equal("RETR bigfile\r\n", commands.shift)
+        assert_equal("ABOR\r\n", commands.shift)
+        assert_equal("PWD\r\n", commands.shift)
+        assert_equal(nil, commands.shift)
+      ensure
+        ftp.close
+      end
+    ensure
+      server.close
+    end
+  end
+
+  def test_retrbinary_cancellable_abort_delayed_reply
+    commands = []
+    server = create_retr_server(commands) { |sock, conn|
+      commands.push(stream_until_abor(sock, conn))
+      sleep(0.5)
+      sock.print("226 Abort successful.\r\n")
+      commands.push(sock.gets)
+      sock.print("257 \"/\" is the current directory.\r\n")
+    }
+    begin
+      ftp = connect_cancellable_ftp(server, commands)
+      begin
+        handle = ftp.retrbinary_cancellable("RETR bigfile")
+        first_chunk = Queue.new
+        cancel_elapsed = nil
+        canceller = Thread.new do
+          first_chunk.pop
+          start = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+          handle.cancel
+          cancel_elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC) - start
+        end
+        received = String.new
+        result = handle.perform do |data|
+          received << data
+          first_chunk.push(true) if received.size == data.size
+        end
+        canceller.join
+        assert_equal(:aborted, result.state)
+        assert_equal(true, result.control_usable?)
+        # cancel waited for the delayed reply instead of returning early
+        assert(cancel_elapsed >= 0.4, "cancel returned after #{cancel_elapsed}s")
+        assert_equal("/", ftp.pwd)
+        assert_match(/\A(PORT|EPRT) /, commands.shift)
+        assert_equal("RETR bigfile\r\n", commands.shift)
+        assert_equal("ABOR\r\n", commands.shift)
+        assert_equal("PWD\r\n", commands.shift)
+        assert_equal(nil, commands.shift)
+      ensure
+        ftp.close
+      end
+    ensure
+      server.close
+    end
+  end
+
+  def test_retrbinary_cancellable_already_completed
+    commands = []
+    server = create_retr_server(commands) { |sock, conn|
+      conn.print("hello")
+      conn.close
+      sock.print("226 Transfer complete.\r\n")
+      commands.push(sock.gets)
+      sock.print("257 \"/\" is the current directory.\r\n")
+    }
+    begin
+      ftp = connect_cancellable_ftp(server, commands)
+      begin
+        handle = ftp.retrbinary_cancellable("RETR smallfile")
+        received = String.new
+        result = handle.perform { |data| received << data }
+        assert_equal(:completed, result.state)
+        assert_equal(true, result.completed?)
+        assert_equal(true, result.control_usable?)
+        assert_equal("hello", received)
+        # the transfer already finished on its own: cancel publishes the
+        # same final result and does not send ABOR
+        cancel_result = handle.cancel
+        assert_same(result, cancel_result)
+        assert_equal("/", ftp.pwd)
+        assert_match(/\A(PORT|EPRT) /, commands.shift)
+        assert_equal("RETR smallfile\r\n", commands.shift)
+        assert_equal("PWD\r\n", commands.shift)
+        assert_equal(nil, commands.shift)
+      ensure
+        ftp.close
+      end
+    ensure
+      server.close
+    end
+  end
+
+  def test_retrbinary_cancellable_data_connection_failed
+    commands = []
+    server = create_retr_server(commands) { |sock, conn|
+      conn.print("partial")
+      sleep(0.2)
+      # abortive close (RST) to make the data connection fail
+      conn.setsockopt(Socket::SOL_SOCKET, Socket::SO_LINGER, [1, 0].pack("ii"))
+      conn.close
+      sock.print("426 Data connection closed.\r\n")
+      commands.push(sock.gets)
+      sock.print("257 \"/\" is the current directory.\r\n")
+    }
+    begin
+      ftp = connect_cancellable_ftp(server, commands)
+      begin
+        handle = ftp.retrbinary_cancellable("RETR broken")
+        result = handle.perform { |data| }
+        assert_equal(:data_connection_failed, result.state)
+        assert_equal(true, result.control_usable?)
+        assert_not_nil(result.error)
+        assert_equal("/", ftp.pwd)
+        assert_match(/\A(PORT|EPRT) /, commands.shift)
+        assert_equal("RETR broken\r\n", commands.shift)
+        assert_equal("PWD\r\n", commands.shift)
+        assert_equal(nil, commands.shift)
+      ensure
+        ftp.close
+      end
+    ensure
+      server.close
+    end
+  end
+
+  def test_retrbinary_cancellable_not_connected
+    ftp = Net::FTP.new
+    handle = ftp.retrbinary_cancellable("RETR foo")
+    result = handle.perform { |data| }
+    assert_equal(:failed, result.state)
+    assert_equal(false, result.control_usable?)
+    assert_kind_of(Net::FTPConnectionError, result.error)
+    assert_raise(Net::FTPError) { handle.perform { |data| } }
+  end
+
   def test_status
     commands = []
     server = create_ftp_server { |sock|
@@ -2734,6 +2931,73 @@ EOF
     assert_equal("AUTH TLS\r\n", commands.shift)
     assert_equal("PBSZ 0\r\n", commands.shift)
     assert_equal("PROT P\r\n", commands.shift)
+  end
+
+  # Scripted server for cancellable transfer tests: handles the login
+  # sequence, PORT/EPRT and RETR, then yields the control socket and the
+  # data connection to the block.
+  def create_retr_server(commands, &block)
+    create_ftp_server { |sock|
+      sock.print("220 (test_ftp).\r\n")
+      commands.push(sock.gets)
+      sock.print("331 Please specify the password.\r\n")
+      commands.push(sock.gets)
+      sock.print("230 Login successful.\r\n")
+      commands.push(sock.gets)
+      sock.print("200 Switching to Binary mode.\r\n")
+      line = sock.gets
+      commands.push(line)
+      host, port = process_port_or_eprt(sock, line)
+      commands.push(sock.gets)
+      sock.print("150 Opening data connection.\r\n")
+      conn = TCPSocket.new(host, port)
+      begin
+        block.call(sock, conn)
+      ensure
+        conn.close unless conn.closed?
+      end
+    }
+  end
+
+  # Streams chunks on the data connection +conn+ until ABOR shows up on
+  # the control connection +sock+, then returns the ABOR line.
+  def stream_until_abor(sock, conn)
+    50.times do
+      begin
+        conn.print("x" * 4096)
+      rescue Errno::EPIPE, Errno::ECONNRESET
+        break
+      end
+      return sock.gets if IO.select([sock], nil, nil, 0.1)
+    end
+    return sock.gets
+  end
+
+  def connect_cancellable_ftp(server, commands)
+    ftp = Net::FTP.new
+    ftp.connect(SERVER_ADDR, server.port)
+    ftp.login
+    assert_match(/\AUSER /, commands.shift)
+    assert_match(/\APASS /, commands.shift)
+    assert_equal("TYPE I\r\n", commands.shift)
+    return ftp
+  end
+
+  # Performs the transfer of +handle+ in the current thread while a
+  # second thread cancels it as soon as the first chunk arrives.
+  # Returns the perform result, the cancel result, and the data received.
+  def perform_with_cancel(handle)
+    first_chunk = Queue.new
+    canceller = Thread.new do
+      first_chunk.pop
+      handle.cancel
+    end
+    received = String.new
+    result = handle.perform do |data|
+      received << data
+      first_chunk.push(true) if received.size == data.size
+    end
+    return result, canceller.value, received
   end
 
   def process_port_or_eprt(sock, line)

@@ -683,6 +683,26 @@ module Net
     end
 
     #
+    # Creates a handle for a cancellable binary download.  Unlike
+    # #retrbinary, this method does not start the transfer; call
+    # CancellableTransfer#perform to run it in the current thread, and
+    # CancellableTransfer#cancel from another thread to abort it while
+    # the data connection is blocked.
+    #
+    # Example:
+    #
+    #   handle = ftp.retrbinary_cancellable("RETR bigfile.zip")
+    #   Thread.new { sleep 1; handle.cancel }
+    #   result = handle.perform { |chunk| file.write(chunk) }
+    #   if result.control_usable?
+    #     ftp.pwd   # the control connection is still usable
+    #   end
+    #
+    def retrbinary_cancellable(cmd, blocksize = DEFAULT_BLOCKSIZE, rest_offset = nil)
+      CancellableTransfer.new(self, cmd, blocksize, rest_offset)
+    end
+
+    #
     # Puts the connection into ASCII (text) mode, issues the given command, and
     # passes the resulting data, one line at a time, to the associated block. If
     # no block is given, prints the lines. Note that +cmd+ is a server command
@@ -1291,6 +1311,157 @@ module Net
       return resp
     end
 
+    # Sends an ABOR command on the control connection without waiting for
+    # its reply.  The replies are collected later by the thread running
+    # the transfer, which is the only thread allowed to read the control
+    # connection; concurrent readers could not tell which reply belongs
+    # to which command, since replies carry no request identifier.
+    #
+    # For FTPS sessions BufferedSSLSocket#send ignores the MSG_OOB flag
+    # and writes the command in-band through the TLS layer; plaintext
+    # out-of-band data would corrupt the encrypted stream.
+    def send_abort_command # :nodoc:
+      debug_print "put: ABOR"
+      @sock.send("ABOR" + CRLF, Socket::MSG_OOB)
+    end
+    private :send_abort_command
+
+    # Runs the transfer described by +handle+ in the current thread.
+    # Exactly one TransferResult is published on the handle, even when
+    # the transfer or the abort recovery fails.
+    def perform_cancellable_transfer(handle, cmd, blocksize, rest_offset) # :nodoc:
+      begin
+        synchronize do
+          with_binary(true) do
+            data_error = nil
+            conn = nil
+            begin
+              # Issuing the transfer command and publishing the data
+              # connection is atomic with respect to #cancel, so an
+              # ABOR can never overtake the transfer command on the
+              # control connection.
+              conn = handle.start_transfer { transfercmd(cmd, rest_offset) }
+              if conn
+                loop do
+                  begin
+                    data = conn.read(blocksize)
+                  rescue => e
+                    data_error = e
+                    break
+                  end
+                  break unless data
+                  yield data
+                end
+                unless handle.cancel_requested?
+                  begin
+                    conn.shutdown(Socket::SHUT_WR) rescue nil
+                    conn.read_timeout = 1
+                    conn.read
+                  rescue
+                  end
+                end
+              end
+            ensure
+              begin
+                conn.close if conn && !conn.closed?
+              rescue
+              end
+              handle.detach_data_connection
+            end
+            settle_cancellable_transfer(handle, data_error)
+          end
+        end
+      rescue => e
+        unless handle.finished?
+          if e.is_a?(FTPReplyError) || e.is_a?(FTPTempError) || e.is_a?(FTPPermError)
+            # The server sent a complete reply (e.g. the transfer command
+            # was rejected), so the control connection is still usable.
+            handle.finish(:failed, [], true, e)
+          else
+            # The state of the control connection can no longer be
+            # determined; close the session instead of risking a
+            # desynchronized reply stream.
+            close rescue nil
+            handle.finish(:failed, [], false, e)
+          end
+        end
+      end
+      handle.result
+    end
+    private :perform_cancellable_transfer
+
+    # Publishes the final result of a cancellable transfer.  If a cancel
+    # request raced with the natural end of the transfer, the first
+    # settled outcome wins and only one result is ever published.
+    def settle_cancellable_transfer(handle, data_error) # :nodoc:
+      if handle.begin_settle
+        settle_aborted_transfer(handle)
+      elsif data_error
+        # The data connection failed without a cancel request.  Consume
+        # the final reply of the transfer command so that the control
+        # connection stays usable; if that is impossible, close the
+        # session.
+        replies = []
+        usable = true
+        begin
+          replies << getmultiline
+        rescue
+          usable = false
+          close rescue nil
+        end
+        handle.finish(:data_connection_failed, replies, usable, data_error)
+      else
+        begin
+          resp = getresp
+          handle.finish(:completed, [resp], true)
+        rescue FTPTempError, FTPPermError => e
+          # A complete reply was received, so the control connection is
+          # still usable even though the transfer failed.
+          handle.finish(:failed, [e.message], true, e)
+        rescue => e
+          close rescue nil
+          handle.finish(:failed, [], false, e)
+        end
+      end
+    end
+    private :settle_cancellable_transfer
+
+    # Collects the replies to an ABOR command and publishes the result.
+    #
+    # The server may answer with a single 225/226 reply, or with a 426
+    # reply (transfer interrupted) followed by a 226 reply.  Both replies
+    # of a 426/226 sequence are consumed here; leaving the second one
+    # pending would corrupt the reply stream of the next command.
+    def settle_aborted_transfer(handle) # :nodoc:
+      replies = []
+      state = nil
+      error = nil
+      begin
+        resp = getmultiline
+        replies << resp
+        case resp[0, 3]
+        when "426"
+          resp = getmultiline
+          replies << resp
+          state = :interrupted if ["225", "226"].include?(resp[0, 3])
+        when "225", "226"
+          state = :aborted
+        end
+      rescue => e
+        error = e
+        state = nil
+      end
+      if state
+        handle.finish(state, replies, true)
+      else
+        # The ABOR exchange did not complete cleanly; the control
+        # connection cannot be trusted anymore, so close the session.
+        close rescue nil
+        handle.finish(:failed, replies, false, error)
+      end
+    end
+    private :settle_aborted_transfer
+
     #
     # Returns the status (STAT command).
     #
@@ -1487,6 +1658,197 @@ module Net
     #
     def debug_print(msg)
       @debug_output << msg + "\n" if @debug_mode && @debug_output
+    end
+
+    # The outcome of a transfer performed through CancellableTransfer.
+    #
+    # The +state+ attribute is one of:
+    #
+    # [:completed]
+    #   The transfer finished on its own before any cancel request took
+    #   effect.
+    # [:aborted]
+    #   A cancel request was issued and the server accepted ABOR with a
+    #   single 225/226 reply.
+    # [:interrupted]
+    #   A cancel request was issued and the control channel received a
+    #   426 reply (transfer interrupted) followed by a 226 reply; both
+    #   replies were consumed.
+    # [:data_connection_failed]
+    #   The data connection failed before the transfer completed.
+    # [:failed]
+    #   The transfer or the abort recovery failed; see #error.
+    #
+    class TransferResult
+      # The final state of the transfer (see the list above).
+      attr_reader :state
+
+      # The control connection replies received while settling the
+      # transfer (for example both replies of a 426/226 sequence).
+      attr_reader :replies
+
+      # The exception that caused a :data_connection_failed or :failed
+      # result, or nil.
+      attr_reader :error
+
+      def initialize(state, replies, control_usable, error = nil) # :nodoc:
+        @state = state
+        @replies = replies.freeze
+        @control_usable = control_usable
+        @error = error
+        freeze
+      end
+
+      # Whether the transfer ran to completion on its own.
+      def completed?
+        @state == :completed
+      end
+
+      # Whether the transfer was aborted on request (either :aborted or
+      # :interrupted).
+      def aborted?
+        @state == :aborted || @state == :interrupted
+      end
+
+      # Whether the control connection is still usable, i.e. every reply
+      # belonging to the transfer and to the abort was consumed and the
+      # next command will receive its own reply.  When this is false the
+      # session has been closed.
+      def control_usable?
+        @control_usable
+      end
+    end
+
+    # A handle for a single cancellable binary download, created by
+    # FTP#retrbinary_cancellable.
+    #
+    # The transfer runs synchronously in the thread calling #perform,
+    # while #cancel may be called from any other thread to abort it.
+    # Only the thread running #perform ever reads the control connection,
+    # so replies are always consumed in order; #cancel merely writes the
+    # ABOR command and interrupts the pending data read.
+    class CancellableTransfer
+      def initialize(ftp, cmd, blocksize, rest_offset) # :nodoc:
+        @ftp = ftp
+        @cmd = cmd
+        @blocksize = blocksize
+        @rest_offset = rest_offset
+        @mutex = Mutex.new
+        @cond = ConditionVariable.new
+        @performed = false
+        @state = :pending
+        @cancel_requested = false
+        @data_conn = nil
+        @result = nil
+      end
+
+      # The TransferResult of the transfer, or nil while the transfer is
+      # still running (or was never started).
+      def result
+        @mutex.synchronize { @result }
+      end
+
+      #
+      # Runs the transfer in the current thread, yielding each chunk of
+      # data like FTP#retrbinary does, and returns the TransferResult.
+      #
+      # Transfer-level failures do not raise; inspect
+      # TransferResult#state and TransferResult#error instead.
+      #
+      def perform
+        @mutex.synchronize do
+          if @performed
+            raise FTPError, "this transfer was already performed"
+          end
+          @performed = true
+        end
+        @ftp.send(:perform_cancellable_transfer,
+                  self, @cmd, @blocksize, @rest_offset) do |data|
+          yield data
+        end
+      end
+
+      #
+      # Requests abortion of the transfer.  Meant to be called from
+      # another thread while #perform is blocked reading the data
+      # connection: sends ABOR on the control connection, interrupts the
+      # pending data read, and waits until the transfer thread has
+      # settled the control connection.  Returns the single final
+      # TransferResult; if the transfer already finished on its own,
+      # that result is returned unchanged and no ABOR is sent.
+      #
+      def cancel
+        @mutex.synchronize do
+          if !@result && !@cancel_requested
+            @cancel_requested = true
+            # Once the transfer thread started settling the control
+            # connection, sending ABOR could only leave a stray reply
+            # behind; wait for the final result instead.
+            if @state != :settling
+              begin
+                @ftp.send(:send_abort_command)
+              rescue
+                # The control connection is broken; the transfer thread
+                # will notice while settling and close the session.
+              end
+              begin
+                @data_conn&.close
+              rescue
+              end
+            end
+          end
+          @cond.wait(@mutex) until @result
+          @result
+        end
+      end
+
+      # :stopdoc:
+      def cancel_requested?
+        @mutex.synchronize { @cancel_requested }
+      end
+
+      def finished?
+        @mutex.synchronize { !@result.nil? }
+      end
+
+      # Runs the block (which issues the transfer command and returns
+      # the data connection) while holding the handle lock, so that a
+      # concurrent #cancel either happens entirely before the transfer
+      # command is sent or entirely after the data connection is
+      # published.  Returns nil when the transfer was already cancelled.
+      def start_transfer
+        @mutex.synchronize do
+          return nil if @cancel_requested
+          conn = yield
+          @data_conn = conn
+          @state = :running
+          conn
+        end
+      end
+
+      # Marks the transfer as settling (the data phase is over and the
+      # final control replies are being consumed) and returns whether a
+      # cancel was requested.
+      def begin_settle
+        @mutex.synchronize do
+          @state = :settling
+          @cancel_requested
+        end
+      end
+
+      def detach_data_connection
+        @mutex.synchronize { @data_conn = nil }
+      end
+
+      def finish(state, replies, control_usable, error = nil)
+        @mutex.synchronize do
+          return false if @result
+          @result = TransferResult.new(state, replies, control_usable, error)
+          @cond.broadcast
+          true
+        end
+      end
+      # :startdoc:
     end
 
     # :stopdoc:
