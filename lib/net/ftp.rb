@@ -93,6 +93,12 @@ module Net
     FTP_PORT = 21
     CRLF = "\r\n"
     DEFAULT_BLOCKSIZE = BufferedIO::BUFSIZE
+    # Private-use area plane used to carry raw bytes that cannot be
+    # decoded in the negotiated path encoding.  Each such byte +b+ is
+    # represented as the character U+F0000+b, which can be encoded back
+    # to the exact byte when a command is sent.
+    PATHNAME_ESCAPE_BASE = 0xF0000
+    PATHNAME_ESCAPE_MAX = 0xF00FF
     @@default_passive = true
     # :startdoc:
 
@@ -153,6 +159,16 @@ module Net
 
     # The server's last response.
     attr_reader :last_response
+
+    # The encoding used for pathnames on this connection, as set by the
+    # +path_encoding+ option of ::new.  Its value is:
+    #
+    # - +nil+ before and without negotiation: pathnames are handled as
+    #   raw bytes (Encoding::ASCII_8BIT);
+    # - an Encoding instance when an explicit legacy encoding was given;
+    # - Encoding::UTF_8 when +:utf8+ (or +:utf_8+) was requested and the
+    #   server successfully answered +FEAT+ and +OPTS UTF8 ON+.
+    attr_reader :path_encoding
 
     # When +true+, connections are in passive mode per default.
     # Default: +true+.
@@ -226,6 +242,28 @@ module Net
     #                connection.  Default: +false+.
     # debug_mode::  When +true+, all traffic to and from the server is
     #               written to +$stdout+.  Default: +false+.
+    # path_encoding:: Controls how pathnames (directories and file names)
+    #                 are encoded on the control connection.  File
+    #                 contents are never converted.  See #path_encoding.
+    #                 The value is one of:
+    #                 [nil (default)]
+    #                   Pathnames are sent and returned verbatim as
+    #                   ASCII-8BIT strings.
+    #                 [an Encoding or encoding name]
+    #                   The fixed legacy encoding of the server (for
+    #                   example +"Windows-31J" or +Encoding::GBK+).
+    #                   Pathnames given in other encodings are converted
+    #                   before a command is sent, and pathnames in
+    #                   replies and listings (NLST, LIST, MLST, MLSD,
+    #                   PWD, ...) are converted to UTF-8.  Bytes that are
+    #                   not valid in the legacy encoding are preserved
+    #                   losslessly so that the names returned can be used
+    #                   to access the exact same entries again.
+    #                 [<tt>:utf8</tt> or <tt>:utf_8</tt>]
+    #                   UTF-8 is negotiated after login with +FEAT+ and
+    #                   +OPTS UTF8 ON+.  The connection stays in its
+    #                   previous (raw bytes) state if either command is
+    #                   rejected, and login then fails.
     #
     def initialize(host = nil, user_or_options = {}, passwd = nil, acct = nil)
       super()
@@ -301,6 +339,7 @@ module Net
       @ssl_handshake_timeout = options[:ssl_handshake_timeout]
       @read_timeout = options[:read_timeout] || 60
       @use_pasv_ip = options[:use_pasv_ip] || false
+      @path_encoding, @utf8_negotiation = resolve_path_encoding(options[:path_encoding])
       if host
         connect(host, options[:port] || FTP_PORT)
         if options[:username]
@@ -469,6 +508,117 @@ module Net
       return line
     end
     private :getline
+
+    def resolve_path_encoding(value) # :nodoc:
+      case value
+      when nil
+        [nil, false]
+      when :utf8, :utf_8
+        [nil, true]
+      when Encoding::ASCII_8BIT, "ASCII-8BIT", "BINARY", "binary"
+        [Encoding::ASCII_8BIT, false]
+      when Encoding::UTF_8, "UTF-8", "utf-8"
+        [Encoding::UTF_8, false]
+      when Encoding
+        [value, false]
+      when String
+        begin
+          [Encoding.find(value), false]
+        rescue ArgumentError
+          raise ArgumentError, "unknown path encoding: #{value}"
+        end
+      else
+        raise ArgumentError,
+          "path_encoding must be nil, :utf8, an Encoding, or an encoding name"
+      end
+    end
+    private :resolve_path_encoding
+
+    # Encode a pathname to the bytes that must be sent on the control
+    # connection.  The conversion is performed before any command (or data
+    # connection setup) is attempted so that an unrepresentable name fails
+    # early with Encoding::UndefinedConversionError.
+    def encode_pathname(pathname) # :nodoc:
+      pathname = String(pathname)
+      encoding = @path_encoding
+      if encoding.nil? || encoding == Encoding::ASCII_8BIT
+        return pathname.b
+      end
+      wire = String.new(encoding: Encoding::ASCII_8BIT)
+      pathname.each_char do |c|
+        if c.ord >= PATHNAME_ESCAPE_BASE && c.ord <= PATHNAME_ESCAPE_MAX
+          wire << (c.ord - PATHNAME_ESCAPE_BASE).chr(Encoding::ASCII_8BIT)
+        else
+          wire << c.encode(encoding).b
+        end
+      end
+      return wire
+    end
+    private :encode_pathname
+
+    # Decode a raw pathname received from the server to UTF-8.  Bytes that
+    # are invalid or incomplete in the path encoding are mapped to private
+    # use characters which encode_pathname turns back into the exact same
+    # bytes, making every returned name usable for another round trip.
+    def decode_pathname(pathname) # :nodoc:
+      encoding = @path_encoding
+      return pathname if encoding.nil?
+      return pathname.b if encoding == Encoding::ASCII_8BIT
+      converter = Encoding::Converter.new(encoding, Encoding::UTF_8)
+      decoded = String.new(encoding: Encoding::UTF_8)
+      source = pathname.b
+      result = converter.primitive_convert(source, decoded, nil, nil)
+      loop do
+        break if result == :finished
+        info = converter.primitive_errinfo
+        bad_bytes = info[3].to_s
+        if result == :invalid_byte_sequence || result == :incomplete_input
+          bad_bytes.each_byte do |b|
+            decoded << (PATHNAME_ESCAPE_BASE + b).chr(Encoding::UTF_8)
+          end
+          break if result == :incomplete_input
+          result = converter.primitive_convert(source, decoded, nil, nil)
+        else
+          raise FTPError,
+                "cannot decode pathname in #{encoding}: #{pathname.inspect}"
+        end
+      end
+      return decoded
+    rescue Encoding::ConverterNotFoundError
+      pathname.b
+    end
+    private :decode_pathname
+
+    # Build a command line such as "CWD path", applying the connection's
+    # path encoding to every path argument.
+    def path_command(command, *pathnames) # :nodoc:
+      encoded = pathnames.map { |p| encode_pathname(p) }
+      return (command.dup.b << " " << encoded.join(" "))
+    end
+    private :path_command
+
+    # Enables UTF-8 pathnames through FEAT/OPTS as described in RFC 2640.
+    # The negotiation is all-or-nothing: @path_encoding is switched to
+    # UTF-8 only after the server positively acknowledges OPTS, so a
+    # rejected FEAT or OPTS never leaves the connection half enabled.
+    def negotiate_utf8_pathnames # :nodoc:
+      resp = sendcmd("FEAT")
+      unless resp.start_with?("211")
+        raise FTPPermError, "UTF-8 is not supported by the server"
+      end
+      supported = resp.each_line.any? do |line|
+        line.start_with?(" ") && line.strip.split(/[ ;]/, 2).first == "UTF8"
+      end
+      unless supported
+        raise FTPPermError, "UTF-8 is not supported by the server"
+      end
+      resp = sendcmd("OPTS UTF8 ON")
+      unless resp.start_with?("2")
+        raise FTPReplyError, resp
+      end
+      @path_encoding = Encoding::UTF_8
+    end
+    private :negotiate_utf8_pathnames
 
     # Receive a section of lines until the response code's match.
     def getmultiline # :nodoc:
@@ -654,6 +804,7 @@ module Net
       end
       @welcome = resp
       send_type_command
+      negotiate_utf8_pathnames if @utf8_negotiation
       @logged_in = true
     end
 
@@ -802,7 +953,7 @@ module Net
       end
       begin
         f&.binmode
-        retrbinary("RETR #{remotefile}", blocksize, rest_offset) do |data|
+        retrbinary(path_command("RETR", remotefile), blocksize, rest_offset) do |data|
           f&.write(data)
           block&.(data)
           result&.concat(data)
@@ -830,7 +981,7 @@ module Net
         result = String.new
       end
       begin
-        retrlines("RETR #{remotefile}") do |line, newline|
+        retrlines(path_command("RETR", remotefile)) do |line, newline|
           l = newline ? line + "\n" : line
           f&.print(l)
           block&.(line, newline)
@@ -875,9 +1026,10 @@ module Net
       begin
         f.binmode
         if rest_offset
-          storbinary("APPE #{remotefile}", f, blocksize, rest_offset, &block)
+          storbinary(path_command("APPE", remotefile), f,
+                     blocksize, rest_offset, &block)
         else
-          storbinary("STOR #{remotefile}", f, blocksize, rest_offset, &block)
+          storbinary(path_command("STOR", remotefile), f, blocksize, rest_offset, &block)
         end
       ensure
         f.close
@@ -896,7 +1048,7 @@ module Net
       f = File.open(localfile)
       response = ''
       begin
-        response = storlines("STOR #{remotefile}", f, &block)
+        response = storlines(path_command("STOR", remotefile), f, &block)
       ensure
         f.close
       end
@@ -931,13 +1083,10 @@ module Net
     # Returns an array of filenames in the remote directory.
     #
     def nlst(dir = nil)
-      cmd = "NLST"
-      if dir
-        cmd = "#{cmd} #{dir}"
-      end
+      cmd = dir ? path_command("NLST", dir) : "NLST"
       files = []
       retrlines(cmd) do |line|
-        files.push(line)
+        files.push(decode_pathname(line))
       end
       return files
     end
@@ -947,13 +1096,10 @@ module Net
     # `ls -l`).  If a block is given, it iterates through the listing.
     #
     def list(*args, &block) # :yield: line
-      cmd = "LIST"
-      args.each do |arg|
-        cmd = "#{cmd} #{arg}"
-      end
+      cmd = args.empty? ? "LIST" : path_command("LIST", *args)
       lines = []
       retrlines(cmd) do |line|
-        lines << line
+        lines << decode_pathname(line)
       end
       if block
         lines.each(&block)
@@ -1120,7 +1266,7 @@ module Net
           name = factname.downcase
           h[name] = FACT_PARSERS[name].(value)
         },
-        pathname)
+        decode_pathname(pathname))
     end
     private :parse_mlsx_entry
 
@@ -1130,7 +1276,7 @@ module Net
     # If +pathname+ is omitted, the current directory is assumed.
     #
     def mlst(pathname = nil)
-      cmd = pathname ? "MLST #{pathname}" : "MLST"
+      cmd = pathname ? path_command("MLST", pathname) : "MLST"
       resp = sendcmd(cmd)
       if !resp.start_with?("250")
         raise FTPReplyError, resp
@@ -1152,7 +1298,7 @@ module Net
     # If +pathname+ is omitted, the current directory is assumed.
     #
     def mlsd(pathname = nil, &block) # :yield: entry
-      cmd = pathname ? "MLSD #{pathname}" : "MLSD"
+      cmd = pathname ? path_command("MLSD", pathname) : "MLSD"
       entries = []
       retrlines(cmd) do |line|
         entries << parse_mlsx_entry(line)
@@ -1167,18 +1313,18 @@ module Net
     # Renames a file on the server.
     #
     def rename(fromname, toname)
-      resp = sendcmd("RNFR #{fromname}")
+      resp = sendcmd(path_command("RNFR", fromname))
       if !resp.start_with?("3")
         raise FTPReplyError, resp
       end
-      voidcmd("RNTO #{toname}")
+      voidcmd(path_command("RNTO", toname))
     end
 
     #
     # Deletes a file on the server.
     #
     def delete(filename)
-      resp = sendcmd("DELE #{filename}")
+      resp = sendcmd(path_command("DELE", filename))
       if resp.start_with?("250")
         return
       elsif resp.start_with?("5")
@@ -1202,8 +1348,7 @@ module Net
           end
         end
       end
-      cmd = "CWD #{dirname}"
-      voidcmd(cmd)
+      voidcmd(path_command("CWD", dirname))
     end
 
     def get_body(resp) # :nodoc:
@@ -1216,7 +1361,7 @@ module Net
     #
     def size(filename)
       with_binary(true) do
-        resp = sendcmd("SIZE #{filename}")
+        resp = sendcmd(path_command("SIZE", filename))
         if !resp.start_with?("213")
           raise FTPReplyError, resp
         end
@@ -1236,8 +1381,8 @@ module Net
     # Creates a remote directory.
     #
     def mkdir(dirname)
-      resp = sendcmd("MKD #{dirname}")
-      return parse257(resp)
+      resp = sendcmd(path_command("MKD", dirname))
+      return decode_pathname(parse257(resp))
     end
 
     #
@@ -1254,7 +1399,7 @@ module Net
     # Removes a remote directory.
     #
     def rmdir(dirname)
-      voidcmd("RMD #{dirname}")
+      voidcmd(path_command("RMD", dirname))
     end
 
     #
@@ -1262,7 +1407,7 @@ module Net
     #
     def pwd
       resp = sendcmd("PWD")
-      return parse257(resp)
+      return decode_pathname(parse257(resp))
     end
     alias getdir pwd
 
@@ -1298,7 +1443,7 @@ module Net
     #            list but a lot faster and over the same tcp session.
     #
     def status(pathname = nil)
-      line = pathname ? "STAT #{pathname}" : "STAT"
+      line = pathname ? path_command("STAT", pathname) : "STAT"
       if /[\r\n]/ =~ line
         raise ArgumentError, "A line must not contain CR or LF"
       end
@@ -1314,7 +1459,7 @@ module Net
     # Use +mtime+ if you want a parsed Time instance.
     #
     def mdtm(filename)
-      resp = sendcmd("MDTM #{filename}")
+      resp = sendcmd(path_command("MDTM", filename))
       if resp.start_with?("213")
         return get_body(resp)
       end

@@ -1602,6 +1602,174 @@ EOF
 
   end
 
+  def test_path_encoding_option
+    assert_nil(Net::FTP.new.path_encoding)
+    assert_nil(Net::FTP.new(nil, path_encoding: :utf8).path_encoding)
+    assert_equal(Encoding::UTF_8,
+                 Net::FTP.new(nil, path_encoding: Encoding::UTF_8).path_encoding)
+    assert_equal(Encoding::Shift_JIS,
+                 Net::FTP.new(nil, path_encoding: "Shift_JIS").path_encoding)
+    assert_equal(Encoding::ASCII_8BIT,
+                 Net::FTP.new(nil, path_encoding: Encoding::ASCII_8BIT).path_encoding)
+    assert_raise(ArgumentError) do
+      Net::FTP.new(nil, path_encoding: 99)
+    end
+    assert_raise(ArgumentError) do
+      Net::FTP.new(nil, path_encoding: "no-such-encoding")
+    end
+  end
+
+  def test_raw_path_encoding_keeps_bytes
+    ftp = Net::FTP.new
+    name = "a; b\xff\xfe".b
+    assert_equal("CWD " + name, ftp.send(:path_command, "CWD", name))
+    assert_equal(name, ftp.send(:decode_pathname, name.dup))
+    assert_equal(Encoding::ASCII_8BIT,
+                 ftp.send(:path_command, "CWD", name).encoding)
+  end
+
+  def test_legacy_path_encoding_encodes_commands
+    ftp = Net::FTP.new(nil, path_encoding: "Shift_JIS")
+    name = "foo bar; メモ"
+    expected = "RETR foo bar; ".b + name[9..-1].encode("Shift_JIS").b
+    assert_equal(expected, ftp.send(:path_command, "RETR", name))
+    assert_equal(Encoding::ASCII_8BIT, expected.encoding)
+    # a name that cannot be represented in the legacy encoding must
+    # fail before any FTP command is sent
+    assert_raise(Encoding::UndefinedConversionError) do
+      ftp.send(:path_command, "RETR", "caf\u00e9")
+    end
+  end
+
+  def test_legacy_path_encoding_round_trip_with_spaces_semicolons_and_bad_bytes
+    ftp = Net::FTP.new(nil, path_encoding: "Shift_JIS")
+    wire = "my dir; メモ".encode("Shift_JIS").b << 0xff << 0xfe
+    decoded = ftp.send(:decode_pathname, wire.dup)
+    assert_equal(Encoding::UTF_8, decoded.encoding)
+    assert(decoded.valid_encoding?)
+    assert(decoded.include?("my dir; メモ"))
+    # the decoded name encodes back to exactly the original wire bytes,
+    # so a follow-up command cannot address another file
+    assert_equal(wire, ftp.send(:encode_pathname, decoded))
+
+    # trailing incomplete byte must also survive
+    tail_wire = "a; b".encode("Shift_JIS").b << 0x82
+    tail_decoded = ftp.send(:decode_pathname, tail_wire.dup)
+    assert_equal(tail_wire, ftp.send(:encode_pathname, tail_decoded))
+  end
+
+  def test_legacy_path_encoding_file_contents_are_not_converted
+    ftp = Net::FTP.new(nil, path_encoding: "Shift_JIS")
+    payload = (0..0xff).map {|i| i.chr}.join
+    # file contents never enter encode/decode_pathname; only the pathname
+    # argument of the command is converted
+    assert_equal("RETR file ".b + "メモ".encode("Shift_JIS").b,
+                 ftp.send(:path_command, "RETR", "file メモ"))
+    assert_equal(Encoding::ASCII_8BIT, payload.encoding)
+  end
+
+  def test_utf8_negotiation_succeeds
+    commands = []
+    ftp = Net::FTP.new(nil, path_encoding: :utf8)
+    pair_ftp_server(nil, ftp: ftp) do |sock|
+      login = Thread.start { ftp.login }
+      commands << sock.gets
+      sock.print("331 password\r\n")
+      commands << sock.gets
+      sock.print("230 logged in\r\n")
+      commands << sock.gets
+      sock.print("200 binary\r\n")
+      commands << sock.gets
+      sock.print("211-Features\r\n LANG EN*\r\n UTF8\r\n211 End\r\n")
+      commands << sock.gets
+      sock.print("200 UTF8 set to ON\r\n")
+      login.join
+    end
+    assert_equal(["USER anonymous\r\n", "PASS anonymous@\r\n",
+                  "TYPE I\r\n", "FEAT\r\n", "OPTS UTF8 ON\r\n"], commands)
+    assert_equal(Encoding::UTF_8, ftp.path_encoding)
+  end
+
+  def test_utf8_negotiation_failure_leaves_raw_mode
+    [{kind: "feat-rejected", reply: "500 FEAT not implemented\r\n"},
+     {kind: "feat-without-utf8", reply: "211-Features\r\n LANG EN*\r\n211 End\r\n"},
+     {kind: "opts-rejected", multi: true}].each do |scenario|
+      commands = []
+      ftp = Net::FTP.new(nil, path_encoding: :utf8)
+      pair_ftp_server(nil, ftp: ftp) do |sock|
+        login = Thread.start do
+          begin
+            ftp.login
+            flunk "login should fail for #{scenario[:kind]}"
+          rescue Net::FTPPermError, Net::FTPReplyError
+          end
+        end
+        commands << sock.gets
+        sock.print("331 password\r\n")
+        commands << sock.gets
+        sock.print("230 logged in\r\n")
+        commands << sock.gets
+        sock.print("200 binary\r\n")
+        commands << sock.gets
+        if scenario[:multi]
+          sock.print("211-Features\r\n UTF8\r\n211 End\r\n")
+          commands << sock.gets
+          sock.print("501 OPTS rejected\r\n")
+          assert_equal("OPTS UTF8 ON\r\n", commands.last)
+        else
+          sock.print(scenario[:reply])
+          assert_equal("FEAT\r\n", commands.last)
+        end
+        login.join
+      end
+      # FEAT/OPTS rejection must not switch the connection to UTF-8
+      assert_nil(ftp.path_encoding)
+      assert_equal(false, ftp.instance_variable_get(:@logged_in))
+      assert_equal("TYPE I\r\n", commands[2])
+      assert_equal("FEAT\r\n", commands[3])
+    end
+  end
+
+  def test_path_encoding_list_mlst_mlsd_same_decoding_and_round_trip
+    ftp = Net::FTP.new(nil, path_encoding: "Shift_JIS")
+    wire_name = ("my dir; メモ".encode("Shift_JIS").b << 0xff << 0xfe)
+
+    # NLST: a bare name
+    nlst_name = ftp.send(:decode_pathname, wire_name.dup)
+    # LIST: the name is the last field of a UNIX-style listing, which may
+    # itself contain spaces and semicolons
+    list_line = "-rw-r--r-- 1 user group 7 Jan 01 00:00 ".b + wire_name.dup
+    decoded_list_line = ftp.send(:decode_pathname, list_line)
+    assert(decoded_list_line.end_with?(nlst_name))
+    # MLST/MLSD: the path follows the facts
+    entry = ftp.send(:parse_mlsx_entry, "Type=file;Size=7; ".b + wire_name.dup)
+    assert_equal(nlst_name, entry.pathname)
+    assert_equal(Encoding::UTF_8, entry.pathname.encoding)
+
+    # every listing must round-trip to the exact same wire bytes, so a
+    # later command cannot address a different entry
+    list_name = decoded_list_line.split(/ +/, 9).last
+    [nlst_name, list_name, entry.pathname].each do |name|
+      assert_equal(wire_name, ftp.send(:encode_pathname, name))
+    end
+    assert_equal("MLST ".b + wire_name,
+                 ftp.send(:path_command, "MLST", entry.pathname))
+  end
+
+  def test_unrepresentable_name_is_not_sent
+    ftp = Net::FTP.new(nil, path_encoding: "Shift_JIS")
+    client_side, server_side = Socket.pair(:UNIX, :STREAM)
+    ftp.set_socket(Net::FTP::BufferedSocket.new(client_side, read_timeout: 1), false)
+    assert_raise(Encoding::UndefinedConversionError) do
+      ftp.chdir("caf\u00e9")
+    end
+    assert_nil(ftp.last_response_code)
+    assert_equal(:wait_readable, server_side.read_nonblock(16, exception: false))
+  ensure
+    client_side&.close
+    server_side&.close
+  end
+
   def test_option
     commands = []
     server = create_ftp_server { |sock|
@@ -2672,6 +2840,28 @@ EOF
   end
 
   private
+
+  # Drives a Net::FTP object connected to one end of an unnamed socket
+  # pair, without binding a TCP port (which is denied in some sandboxes).
+  def pair_ftp_server(greeting, ftp: nil)
+    client_side, server_side = Socket.pair(:UNIX, :STREAM)
+    ftp ||= Net::FTP.new(nil, path_encoding: :utf8)
+    ftp.set_socket(Net::FTP::BufferedSocket.new(client_side, read_timeout: 5),
+                   false)
+    thread = Thread.start do
+      begin
+        yield(server_side, ftp)
+      ensure
+        server_side.close unless server_side.closed?
+      end
+    end
+    ftp
+  ensure
+    if thread
+      thread.join
+      client_side.close unless client_side.closed?
+    end
+  end
 
   def create_ftp_server(sleep_time = nil, addr = SERVER_ADDR)
     server = TCPServer.new(addr, 0)
