@@ -154,6 +154,12 @@ module Net
     # The server's last response.
     attr_reader :last_response
 
+    # The connection's pathname encoding policy: +nil+ when pathnames
+    # are sent to and received from the server as raw bytes, or an
+    # Encoding used for pathnames on the wire.  See the
+    # +path_encoding+ option of Net::FTP.new and #negotiate_utf8!.
+    attr_reader :path_encoding
+
     # When +true+, connections are in passive mode per default.
     # Default: +true+.
     def self.default_passive=(value)
@@ -226,6 +232,19 @@ module Net
     #                connection.  Default: +false+.
     # debug_mode::  When +true+, all traffic to and from the server is
     #               written to +$stdout+.  Default: +false+.
+    # path_encoding::  Policy for converting pathnames between the client
+    #                  and the server.  +nil+ or +:raw+ (the default)
+    #                  sends and returns pathnames as raw bytes.  An
+    #                  Encoding or an encoding name (e.g. Shift_JIS or
+    #                  GB18030) transcodes pathnames to and from that
+    #                  legacy encoding on the wire; names that cannot be
+    #                  represented raise an Encoding error before any
+    #                  command is sent.  +:utf8+ negotiates UTF-8
+    #                  pathnames with the server (FEAT and OPTS UTF8 ON)
+    #                  after login; if the negotiation is rejected, the
+    #                  connection keeps the raw-bytes policy.  Only
+    #                  pathnames are converted; file contents are never
+    #                  transcoded.
     #
     def initialize(host = nil, user_or_options = {}, passwd = nil, acct = nil)
       super()
@@ -301,6 +320,14 @@ module Net
       @ssl_handshake_timeout = options[:ssl_handshake_timeout]
       @read_timeout = options[:read_timeout] || 60
       @use_pasv_ip = options[:use_pasv_ip] || false
+      @utf8_negotiated = false
+      if options[:path_encoding] == :utf8
+        @negotiate_utf8_on_login = true
+        @path_encoding = nil
+      else
+        @negotiate_utf8_on_login = false
+        @path_encoding = normalize_path_encoding(options[:path_encoding])
+      end
       if host
         connect(host, options[:port] || FTP_PORT)
         if options[:username]
@@ -402,6 +429,13 @@ module Net
     def connect(host, port = FTP_PORT)
       debug_print "connect: #{host}:#{port}"
       synchronize do
+        if @utf8_negotiated
+          # Negotiated UTF-8 does not carry over to a new connection;
+          # negotiate again after the next login.
+          @utf8_negotiated = false
+          @path_encoding = nil
+          @negotiate_utf8_on_login = true
+        end
         @host = host
         @bare_sock = open_socket(host, port)
         if @ssl_context
@@ -448,6 +482,58 @@ module Net
       end
     end
     private :sanitize
+
+    # Normalizes a path encoding policy given as +nil+, +:raw+, an
+    # Encoding, or an encoding name.  Returns +nil+ for the raw-bytes
+    # policy.
+    def normalize_path_encoding(enc) # :nodoc:
+      case enc
+      when nil, :raw
+        return nil
+      when :utf8
+        raise ArgumentError,
+              "use Net::FTP.new(path_encoding: :utf8) or #negotiate_utf8! " \
+              "for negotiated UTF-8"
+      end
+      enc = enc.is_a?(Encoding) ? enc : Encoding.find(enc.to_s)
+      unless enc.ascii_compatible?
+        raise ArgumentError,
+              "path encoding must be ASCII-compatible: #{enc.name}"
+      end
+      return enc == Encoding::ASCII_8BIT ? nil : enc
+    end
+    private :normalize_path_encoding
+
+    # Encodes +name+ for the wire according to the connection's path
+    # encoding policy.  Binary (ASCII-8BIT) names are always sent
+    # as-is, so raw names obtained from listings address the same file
+    # again.  Raises Encoding::UndefinedConversionError or
+    # Encoding::InvalidByteSequenceError when +name+ cannot be
+    # represented in the wire encoding; the error is raised before any
+    # command is sent.
+    def encode_path(name) # :nodoc:
+      if @path_encoding.nil? || name.encoding == Encoding::ASCII_8BIT
+        name
+      else
+        name.encode(@path_encoding)
+      end
+    end
+    private :encode_path
+
+    # Decodes a pathname received from the server according to the
+    # connection's path encoding policy.  Names that are not valid in
+    # the wire encoding are returned as raw bytes, so they can be used
+    # to access the same file again.
+    def decode_path(name) # :nodoc:
+      return name if @path_encoding.nil?
+      decoded = name.dup.force_encoding(@path_encoding)
+      if decoded.valid_encoding?
+        decoded.encode(Encoding::UTF_8)
+      else
+        name
+      end
+    end
+    private :decode_path
 
     # Ensures that +line+ has a control return / line feed (CRLF) and writes
     # it to the socket.
@@ -655,6 +741,7 @@ module Net
       @welcome = resp
       send_type_command
       @logged_in = true
+      negotiate_utf8! if @negotiate_utf8_on_login
     end
 
     #
@@ -787,6 +874,7 @@ module Net
     #
     def getbinaryfile(remotefile, localfile = File.basename(remotefile),
                       blocksize = DEFAULT_BLOCKSIZE, &block) # :yield: data
+      remotefile = encode_path(remotefile)
       f = nil
       result = nil
       if localfile
@@ -822,6 +910,7 @@ module Net
     #
     def gettextfile(remotefile, localfile = File.basename(remotefile),
                     &block) # :yield: line
+      remotefile = encode_path(remotefile)
       f = nil
       result = nil
       if localfile
@@ -862,6 +951,7 @@ module Net
     #
     def putbinaryfile(localfile, remotefile = File.basename(localfile),
                       blocksize = DEFAULT_BLOCKSIZE, &block) # :yield: data
+      remotefile = encode_path(remotefile)
       if @resume
         begin
           rest_offset = size(remotefile)
@@ -893,6 +983,7 @@ module Net
     # after issuing 'quote site filetype=jes'
     #
     def puttextfile(localfile, remotefile = File.basename(localfile), &block) # :yield: line
+      remotefile = encode_path(remotefile)
       f = File.open(localfile)
       response = ''
       begin
@@ -933,11 +1024,11 @@ module Net
     def nlst(dir = nil)
       cmd = "NLST"
       if dir
-        cmd = "#{cmd} #{dir}"
+        cmd = "#{cmd} #{encode_path(dir)}"
       end
       files = []
       retrlines(cmd) do |line|
-        files.push(line)
+        files.push(decode_path(line))
       end
       return files
     end
@@ -949,11 +1040,11 @@ module Net
     def list(*args, &block) # :yield: line
       cmd = "LIST"
       args.each do |arg|
-        cmd = "#{cmd} #{arg}"
+        cmd = "#{cmd} #{encode_path(arg)}"
       end
       lines = []
       retrlines(cmd) do |line|
-        lines << line
+        lines << decode_path(line)
       end
       if block
         lines.each(&block)
@@ -971,9 +1062,16 @@ module Net
     class MLSxEntry
       attr_reader :facts, :pathname
 
-      def initialize(facts, pathname)
+      # The pathname as raw bytes received from the server, before any
+      # path encoding conversion.  Use it instead of #pathname to access
+      # the entry again when the original bytes are not representable
+      # in the decoded encoding.
+      attr_reader :raw_pathname
+
+      def initialize(facts, pathname, raw_pathname = nil)
         @facts = facts
         @pathname = pathname
+        @raw_pathname = raw_pathname || pathname
       end
 
       standard_facts = %w(size modify create type unique perm
@@ -1120,6 +1218,7 @@ module Net
           name = factname.downcase
           h[name] = FACT_PARSERS[name].(value)
         },
+        decode_path(pathname),
         pathname)
     end
     private :parse_mlsx_entry
@@ -1130,7 +1229,7 @@ module Net
     # If +pathname+ is omitted, the current directory is assumed.
     #
     def mlst(pathname = nil)
-      cmd = pathname ? "MLST #{pathname}" : "MLST"
+      cmd = pathname ? "MLST #{encode_path(pathname)}" : "MLST"
       resp = sendcmd(cmd)
       if !resp.start_with?("250")
         raise FTPReplyError, resp
@@ -1152,7 +1251,7 @@ module Net
     # If +pathname+ is omitted, the current directory is assumed.
     #
     def mlsd(pathname = nil, &block) # :yield: entry
-      cmd = pathname ? "MLSD #{pathname}" : "MLSD"
+      cmd = pathname ? "MLSD #{encode_path(pathname)}" : "MLSD"
       entries = []
       retrlines(cmd) do |line|
         entries << parse_mlsx_entry(line)
@@ -1167,6 +1266,8 @@ module Net
     # Renames a file on the server.
     #
     def rename(fromname, toname)
+      fromname = encode_path(fromname)
+      toname = encode_path(toname)
       resp = sendcmd("RNFR #{fromname}")
       if !resp.start_with?("3")
         raise FTPReplyError, resp
@@ -1178,7 +1279,7 @@ module Net
     # Deletes a file on the server.
     #
     def delete(filename)
-      resp = sendcmd("DELE #{filename}")
+      resp = sendcmd("DELE #{encode_path(filename)}")
       if resp.start_with?("250")
         return
       elsif resp.start_with?("5")
@@ -1202,8 +1303,7 @@ module Net
           end
         end
       end
-      cmd = "CWD #{dirname}"
-      voidcmd(cmd)
+      voidcmd("CWD #{encode_path(dirname)}")
     end
 
     def get_body(resp) # :nodoc:
@@ -1215,6 +1315,7 @@ module Net
     # Returns the size of the given (remote) filename.
     #
     def size(filename)
+      filename = encode_path(filename)
       with_binary(true) do
         resp = sendcmd("SIZE #{filename}")
         if !resp.start_with?("213")
@@ -1236,7 +1337,7 @@ module Net
     # Creates a remote directory.
     #
     def mkdir(dirname)
-      resp = sendcmd("MKD #{dirname}")
+      resp = sendcmd("MKD #{encode_path(dirname)}")
       return parse257(resp)
     end
 
@@ -1254,7 +1355,7 @@ module Net
     # Removes a remote directory.
     #
     def rmdir(dirname)
-      voidcmd("RMD #{dirname}")
+      voidcmd("RMD #{encode_path(dirname)}")
     end
 
     #
@@ -1298,7 +1399,7 @@ module Net
     #            list but a lot faster and over the same tcp session.
     #
     def status(pathname = nil)
-      line = pathname ? "STAT #{pathname}" : "STAT"
+      line = pathname ? "STAT #{encode_path(pathname)}" : "STAT"
       if /[\r\n]/ =~ line
         raise ArgumentError, "A line must not contain CR or LF"
       end
@@ -1314,7 +1415,7 @@ module Net
     # Use +mtime+ if you want a parsed Time instance.
     #
     def mdtm(filename)
-      resp = sendcmd("MDTM #{filename}")
+      resp = sendcmd("MDTM #{encode_path(filename)}")
       if resp.start_with?("213")
         return get_body(resp)
       end
@@ -1388,6 +1489,38 @@ module Net
       cmd += " #{params}" if params
 
       voidcmd(cmd)
+    end
+
+    #
+    # Sets the pathname encoding policy for this connection.  Accepts
+    # +nil+ or +:raw+ (pathnames are sent and returned as raw bytes) or
+    # an Encoding/encoding name used for pathnames on the wire.  Use
+    # #negotiate_utf8! (or the +:utf8+ option of Net::FTP.new) for
+    # negotiated UTF-8 instead.
+    #
+    def path_encoding=(enc)
+      @path_encoding = normalize_path_encoding(enc)
+      @utf8_negotiated = false
+      @negotiate_utf8_on_login = false
+    end
+
+    #
+    # Negotiates UTF-8 pathnames with the server (RFC 2640): checks
+    # that FEAT advertises UTF8 and then enables it with OPTS UTF8 ON.
+    # On success the connection's path encoding policy becomes
+    # Encoding::UTF_8.  If the server rejects FEAT or OPTS, or does not
+    # advertise UTF8, an error is raised and the previous policy is
+    # left intact.
+    #
+    def negotiate_utf8!
+      feats = features
+      unless feats.any? { |f| /\AUTF8\b/i.match?(f) }
+        raise FTPError, "the server does not support UTF-8 pathnames"
+      end
+      option("UTF8", "ON")
+      @path_encoding = Encoding::UTF_8
+      @utf8_negotiated = true
+      @negotiate_utf8_on_login = false
     end
 
     #
@@ -1478,7 +1611,7 @@ module Net
       if !resp.start_with?("257")
         raise FTPReplyError, resp
       end
-      return resp.slice(/"(([^"]|"")*)"/, 1).to_s.gsub(/""/, '"')
+      return decode_path(resp.slice(/"(([^"]|"")*)"/, 1).to_s.gsub(/""/, '"'))
     end
     private :parse257
 

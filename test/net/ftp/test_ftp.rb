@@ -2671,6 +2671,390 @@ EOF
     end
   end
 
+  def test_path_encoding_legacy
+    commands = []
+    server = create_ftp_server { |sock|
+      sock.print("220 (test_ftp).\r\n")
+      commands.push(sock.gets)
+      sock.print("250 OK\r\n")
+      commands.push(sock.gets)
+      sock.print("250 OK\r\n")
+      commands.push(sock.gets)
+      sock.print("257 \"" + "报告".encode("GB18030") + "\" created\r\n")
+      commands.push(sock.gets)
+      sock.print("250 OK\r\n")
+    }
+    begin
+      begin
+        ftp = Net::FTP.new(nil, path_encoding: "GB18030")
+        ftp.read_timeout *= 5 if mjit_enabled? # for --jit-wait
+        ftp.connect(SERVER_ADDR, server.port)
+        assert_equal(Encoding::GB18030, ftp.path_encoding)
+        ftp.chdir("报告")
+        ftp.delete("数据.txt")
+        assert_equal("报告", ftp.mkdir("报告"))
+        ftp.path_encoding = :raw
+        assert_nil(ftp.path_encoding)
+        ftp.chdir("报告")
+        assert_equal(("CWD " + "报告".encode("GB18030") + "\r\n").b,
+                     commands.shift)
+        assert_equal(("DELE " + "数据.txt".encode("GB18030") + "\r\n").b,
+                     commands.shift)
+        assert_equal(("MKD " + "报告".encode("GB18030") + "\r\n").b,
+                     commands.shift)
+        assert_equal("CWD 报告\r\n".b, commands.shift)
+        assert_nil(commands.shift)
+      ensure
+        ftp.close if ftp
+      end
+    ensure
+      server.close
+    end
+  end
+
+  def test_path_encoding_unrepresentable_name
+    # The name is rejected before anything is sent; there is not even a
+    # connection here, so a socket write would raise FTPConnectionError.
+    ftp = Net::FTP.new(nil, path_encoding: "Shift_JIS")
+    assert_raise(Encoding::UndefinedConversionError) do
+      ftp.chdir("café")
+    end
+    assert_raise(Encoding::UndefinedConversionError) do
+      ftp.size("café")
+    end
+
+    # On a live connection, no command may be sent for the bad name,
+    # not even RNFR when the unrepresentable name is the RNTO argument.
+    commands = []
+    server = create_ftp_server { |sock|
+      sock.print("220 (test_ftp).\r\n")
+      commands.push(sock.gets)
+      sock.print("200 OK\r\n")
+    }
+    begin
+      begin
+        ftp = Net::FTP.new(nil, path_encoding: "Shift_JIS")
+        ftp.read_timeout *= 5 if mjit_enabled? # for --jit-wait
+        ftp.connect(SERVER_ADDR, server.port)
+        assert_raise(Encoding::UndefinedConversionError) do
+          ftp.chdir("café")
+        end
+        assert_raise(Encoding::UndefinedConversionError) do
+          ftp.rename("ok.txt", "café.txt")
+        end
+        ftp.noop
+        assert_equal("NOOP\r\n", commands.shift)
+        assert_nil(commands.shift)
+      ensure
+        ftp.close if ftp
+      end
+    ensure
+      server.close
+    end
+  end
+
+  def test_path_encoding_utf8_negotiation
+    commands = []
+    server = create_ftp_server { |sock|
+      sock.print("220 (test_ftp).\r\n")
+      commands.push(sock.gets)
+      sock.print("331 Password required\r\n")
+      commands.push(sock.gets)
+      sock.print("230 Logged in\r\n")
+      commands.push(sock.gets)
+      sock.print("200 OK\r\n")
+      commands.push(sock.gets)
+      sock.print("211-Features\r\n")
+      sock.print(" UTF8\r\n")
+      sock.print("211 End\r\n")
+      commands.push(sock.gets)
+      sock.print("200 UTF8 ON\r\n")
+      commands.push(sock.gets)
+      sock.print("250 OK\r\n")
+    }
+    begin
+      begin
+        ftp = Net::FTP.new(nil, path_encoding: :utf8)
+        ftp.read_timeout *= 5 if mjit_enabled? # for --jit-wait
+        assert_raise(ArgumentError) do
+          ftp.path_encoding = :utf8
+        end
+        ftp.connect(SERVER_ADDR, server.port)
+        assert_nil(ftp.path_encoding) # not negotiated yet
+        ftp.login("user", "pass")
+        assert_equal(Encoding::UTF_8, ftp.path_encoding)
+        ftp.chdir("日本語")
+        assert_equal("USER user\r\n", commands.shift)
+        assert_equal("PASS pass\r\n", commands.shift)
+        assert_equal("TYPE I\r\n", commands.shift)
+        assert_equal("FEAT\r\n", commands.shift)
+        assert_equal("OPTS UTF8 ON\r\n", commands.shift)
+        assert_equal("CWD 日本語\r\n".b, commands.shift)
+        assert_nil(commands.shift)
+      ensure
+        ftp.close if ftp
+      end
+    ensure
+      server.close
+    end
+  end
+
+  def test_path_encoding_utf8_negotiation_feat_rejected
+    commands = []
+    server = create_ftp_server { |sock|
+      sock.print("220 (test_ftp).\r\n")
+      commands.push(sock.gets)
+      sock.print("331 Password required\r\n")
+      commands.push(sock.gets)
+      sock.print("230 Logged in\r\n")
+      commands.push(sock.gets)
+      sock.print("200 OK\r\n")
+      commands.push(sock.gets)
+      sock.print("502 FEAT not implemented\r\n")
+      commands.push(sock.gets)
+      sock.print("250 OK\r\n")
+    }
+    begin
+      begin
+        ftp = Net::FTP.new(nil, path_encoding: :utf8)
+        ftp.read_timeout *= 5 if mjit_enabled? # for --jit-wait
+        ftp.connect(SERVER_ADDR, server.port)
+        assert_raise(Net::FTPPermError) do
+          ftp.login("user", "pass")
+        end
+        # no half-enabled state: the connection stays in raw-bytes mode
+        assert_nil(ftp.path_encoding)
+        ftp.chdir("日本語")
+        assert_equal("USER user\r\n", commands.shift)
+        assert_equal("PASS pass\r\n", commands.shift)
+        assert_equal("TYPE I\r\n", commands.shift)
+        assert_equal("FEAT\r\n", commands.shift)
+        assert_equal("CWD 日本語\r\n".b, commands.shift)
+        assert_nil(commands.shift)
+      ensure
+        ftp.close if ftp
+      end
+    ensure
+      server.close
+    end
+  end
+
+  def test_path_encoding_utf8_negotiation_opts_rejected
+    commands = []
+    server = create_ftp_server { |sock|
+      sock.print("220 (test_ftp).\r\n")
+      commands.push(sock.gets)
+      sock.print("331 Password required\r\n")
+      commands.push(sock.gets)
+      sock.print("230 Logged in\r\n")
+      commands.push(sock.gets)
+      sock.print("200 OK\r\n")
+      commands.push(sock.gets)
+      sock.print("211-Features\r\n")
+      sock.print(" UTF8\r\n")
+      sock.print("211 End\r\n")
+      commands.push(sock.gets)
+      sock.print("502 OPTS not allowed\r\n")
+      commands.push(sock.gets)
+      sock.print("250 OK\r\n")
+    }
+    begin
+      begin
+        ftp = Net::FTP.new(nil, path_encoding: :utf8)
+        ftp.read_timeout *= 5 if mjit_enabled? # for --jit-wait
+        ftp.connect(SERVER_ADDR, server.port)
+        assert_raise(Net::FTPPermError) do
+          ftp.login("user", "pass")
+        end
+        # OPTS was refused, so UTF-8 must not be left enabled
+        assert_nil(ftp.path_encoding)
+        ftp.chdir("日本語")
+        assert_equal("USER user\r\n", commands.shift)
+        assert_equal("PASS pass\r\n", commands.shift)
+        assert_equal("TYPE I\r\n", commands.shift)
+        assert_equal("FEAT\r\n", commands.shift)
+        assert_equal("OPTS UTF8 ON\r\n", commands.shift)
+        assert_equal("CWD 日本語\r\n".b, commands.shift)
+        assert_nil(commands.shift)
+      ensure
+        ftp.close if ftp
+      end
+    ensure
+      server.close
+    end
+  end
+
+  def test_path_encoding_utf8_negotiation_not_advertised
+    commands = []
+    server = create_ftp_server { |sock|
+      sock.print("220 (test_ftp).\r\n")
+      commands.push(sock.gets)
+      sock.print("331 Password required\r\n")
+      commands.push(sock.gets)
+      sock.print("230 Logged in\r\n")
+      commands.push(sock.gets)
+      sock.print("200 OK\r\n")
+      commands.push(sock.gets)
+      sock.print("211-Features\r\n")
+      sock.print(" LANG EN\r\n")
+      sock.print("211 End\r\n")
+      commands.push(sock.gets)
+      sock.print("250 OK\r\n")
+    }
+    begin
+      begin
+        ftp = Net::FTP.new(nil, path_encoding: :utf8)
+        ftp.read_timeout *= 5 if mjit_enabled? # for --jit-wait
+        ftp.connect(SERVER_ADDR, server.port)
+        assert_raise(Net::FTPError) do
+          ftp.login("user", "pass")
+        end
+        assert_nil(ftp.path_encoding)
+        ftp.chdir("日本語")
+        assert_equal("USER user\r\n", commands.shift)
+        assert_equal("PASS pass\r\n", commands.shift)
+        assert_equal("TYPE I\r\n", commands.shift)
+        assert_equal("FEAT\r\n", commands.shift)
+        # OPTS is not sent when UTF8 is not advertised
+        assert_equal("CWD 日本語\r\n".b, commands.shift)
+        assert_nil(commands.shift)
+      ensure
+        ftp.close if ftp
+      end
+    ensure
+      server.close
+    end
+  end
+
+  def test_path_encoding_mlsd_roundtrip
+    commands = []
+    wire_names = [
+      "foo bar.txt",                 # space
+      "semi;colon.txt",              # semicolon
+      "inv\xFF\xFEalid.txt".b,        # bytes invalid in GB18030
+      "报告.txt".encode("GB18030"), # legacy-encoded name
+    ]
+    server = create_ftp_server { |sock|
+      sock.print("220 (test_ftp).\r\n")
+      line = sock.gets
+      commands.push(line)
+      host, port = process_port_or_eprt(sock, line)
+      commands.push(sock.gets)
+      sock.print("150 Here comes the directory listing.\r\n")
+      begin
+        conn = TCPSocket.new(host, port)
+        wire_names.each do |name|
+          conn.write("Type=file;Size=1;Modify=20200101000000; ".b + name.b + "\r\n")
+        end
+      ensure
+        conn.close
+      end
+      sock.print("226 Directory send OK.\r\n")
+      (wire_names.size * 2).times do
+        commands.push(sock.gets)
+        sock.print("213 1\r\n")
+      end
+    }
+    begin
+      begin
+        ftp = Net::FTP.new(nil, path_encoding: "GB18030")
+        ftp.read_timeout *= 5 if mjit_enabled? # for --jit-wait
+        ftp.connect(SERVER_ADDR, server.port)
+        entries = ftp.mlsd("/")
+        assert_equal(4, entries.size)
+        assert_equal("foo bar.txt", entries[0].pathname)
+        assert_equal(Encoding::UTF_8, entries[0].pathname.encoding)
+        assert_equal("semi;colon.txt", entries[1].pathname)
+        assert_equal("file", entries[1].facts["type"])
+        # invalid bytes are preserved as raw bytes for re-access
+        assert_equal(wire_names[2], entries[2].pathname)
+        assert_equal(Encoding::ASCII_8BIT, entries[2].pathname.encoding)
+        assert_equal("报告.txt", entries[3].pathname)
+        assert_equal(Encoding::UTF_8, entries[3].pathname.encoding)
+        entries.each_with_index do |entry, i|
+          assert_equal(wire_names[i].b, entry.raw_pathname.b)
+        end
+        # re-access through decoded names and raw names alike must send
+        # the exact original bytes, i.e. address the same file
+        entries.each { |entry| ftp.size(entry.pathname) }
+        entries.each { |entry| ftp.size(entry.raw_pathname) }
+        assert_match(/\A(PORT|EPRT) /, commands.shift)
+        assert_equal("MLSD /\r\n", commands.shift)
+        (wire_names.size * 2).times do |i|
+          assert_equal("SIZE ".b + wire_names[i % wire_names.size].b + "\r\n",
+                       commands.shift)
+        end
+        assert_nil(commands.shift)
+      ensure
+        ftp.close if ftp
+      end
+    ensure
+      server.close
+    end
+  end
+
+  def test_path_encoding_list_and_nlst
+    commands = []
+    prefix = "-rw-r--r-- 1 0 0 123 Jan 01 00:00 "
+    valid = "报告.txt".encode("GB18030")
+    invalid = "inv\xFFalid.txt".b
+    server = create_ftp_server { |sock|
+      sock.print("220 (test_ftp).\r\n")
+      line = sock.gets
+      commands.push(line)
+      host, port = process_port_or_eprt(sock, line)
+      commands.push(sock.gets)
+      sock.print("150 Here comes the directory listing.\r\n")
+      begin
+        conn = TCPSocket.new(host, port)
+        conn.write(prefix + valid + "\r\n")
+        conn.write(prefix + invalid + "\r\n")
+      ensure
+        conn.close
+      end
+      sock.print("226 Directory send OK.\r\n")
+      line = sock.gets
+      commands.push(line)
+      host, port = process_port_or_eprt(sock, line)
+      commands.push(sock.gets)
+      sock.print("150 Here comes the directory listing.\r\n")
+      begin
+        conn = TCPSocket.new(host, port)
+        conn.write(valid + "\r\n")
+        conn.write(invalid + "\r\n")
+      ensure
+        conn.close
+      end
+      sock.print("226 Directory send OK.\r\n")
+    }
+    begin
+      begin
+        ftp = Net::FTP.new(nil, path_encoding: "GB18030")
+        ftp.read_timeout *= 5 if mjit_enabled? # for --jit-wait
+        ftp.connect(SERVER_ADDR, server.port)
+        lines = ftp.list
+        assert_equal(prefix + "报告.txt", lines[0])
+        assert_equal(Encoding::UTF_8, lines[0].encoding)
+        assert_equal(prefix + invalid, lines[1])
+        assert_equal(Encoding::ASCII_8BIT, lines[1].encoding)
+        names = ftp.nlst
+        assert_equal("报告.txt", names[0])
+        assert_equal(Encoding::UTF_8, names[0].encoding)
+        assert_equal(invalid, names[1])
+        assert_equal(Encoding::ASCII_8BIT, names[1].encoding)
+        assert_match(/\A(PORT|EPRT) /, commands.shift)
+        assert_equal("LIST\r\n", commands.shift)
+        assert_match(/\A(PORT|EPRT) /, commands.shift)
+        assert_equal("NLST\r\n", commands.shift)
+        assert_nil(commands.shift)
+      ensure
+        ftp.close if ftp
+      end
+    ensure
+      server.close
+    end
+  end
+
   private
 
   def create_ftp_server(sleep_time = nil, addr = SERVER_ADDR)
